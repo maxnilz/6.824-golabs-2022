@@ -3,6 +3,7 @@ main/mr-tmp/
 mrtmp.*
 824-mrinput-*.txt
 /main/diff.out
+/main/mr-out*
 /mapreduce/x.txt
 /pbservice/x.txt
 /kvpaxos/x.txt
