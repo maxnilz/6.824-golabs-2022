@@ -32,7 +32,8 @@ func TestCh(t *testing.T) {
 			select {
 			case val := <-ch:
 				if !val {
-					continue
+					println("000")
+					return
 				}
 				println("0", val)
 			}
@@ -46,7 +47,8 @@ func TestCh(t *testing.T) {
 			select {
 			case val := <-ch:
 				if !val {
-					continue
+					println("111")
+					return
 				}
 				println("1", val)
 			}
