@@ -111,10 +111,12 @@ type Raft struct {
 
 	applyCh chan ApplyMsg
 
-	electionTimerResetCh chan struct{}
-
 	// notify any leader task to exit via close this channel
-	done       chan struct{}
+	doneCh chan struct{}
+
+	// notify any candidate state server to become follower by send a signal to this channel
+	followerCh chan struct{}
+
 	heartbeats int64
 
 	logger *log.Logger
@@ -218,15 +220,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	term := rf.currentTerm
 	if args.Term < rf.currentTerm {
-		rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d", args.CandidateId, args.Term, term)
+		rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d", args.CandidateId, args.Term, rf.currentTerm)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
-	}
-	if args.Term > rf.currentTerm {
-		rf.foundHigherTerm(invalidId, args.Term, fmt.Sprintf("rv req, candidate: %d", args.CandidateId))
 	}
 
 	lastLogIndex, lastLogTerm := rf.last()
@@ -245,10 +243,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		voteGranted = true
 	}
 	if voteGranted {
-		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
-		rf.electionTimerResetCh <- struct{}{}
+		rf.votedFor = args.CandidateId
+	}
+
+	term := rf.currentTerm
+	if voteGranted || args.Term > term {
+		rf.convertToFollower(invalidId, args.Term, fmt.Sprintf("rv req, candidate: %d", args.CandidateId))
 	}
 	rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d -> %d, votedFor: %d, allow: %v, uptodate: %v, granted: %v",
 		args.CandidateId, args.Term, term, rf.currentTerm, rf.votedFor, isAllowedCandidate, isUpToDate(), voteGranted)
@@ -322,9 +324,6 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	defer rf.mu.Unlock()
 
 	rf.logger.Printf("AppendEntry, leader: %d, args.term: %d, curTerm: %d", args.LeaderId, args.Term, rf.currentTerm)
-	if args.Term > rf.currentTerm {
-		rf.foundHigherTerm(args.LeaderId, args.Term, "ae req")
-	}
 	reply.Success = true
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -332,7 +331,9 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Success = false
 		return
 	}
-	rf.electionTimerResetCh <- struct{}{}
+	if reply.Success || args.Term > rf.currentTerm {
+		rf.convertToFollower(args.LeaderId, args.Term, "ae req")
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -407,26 +408,28 @@ func (rf *Raft) ticker() {
 		rndn := rnd.Intn(upperBound)
 		timeout := time.Duration(timeoutMs+rndn) * time.Millisecond
 		timer := time.NewTimer(timeout)
+		cancel := make(chan struct{})
 		select {
 		case val := <-timer.C:
 			if val.IsZero() {
 				continue // timer ch is closed somewhere else
 			}
-			ok := rf.elect()
+			ok := rf.elect(cancel)
 			if !ok {
 				// election have not granted by peers, so waiting next timer
 				continue
 			}
 			// election succeed, become to leader and send empty AE to peers
 			rf.declareLeadership()
-		case <-rf.electionTimerResetCh:
+		case <-rf.followerCh:
+			close(cancel)
 			timer.Stop()
 			rf.logger.Printf("electing, reset election timer")
 		}
 	}
 }
 
-func (rf *Raft) elect() bool {
+func (rf *Raft) elect(cancel chan struct{}) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -479,17 +482,21 @@ func (rf *Raft) elect() bool {
 			case <-time.After(timeout):
 				atomic.StoreInt32(&votes[server], rejectedVote)
 				rf.logger.Printf("electing, send RequestVote req to %d, term: %d timeout", server, args.Term)
+			case <-cancel:
+				atomic.StoreInt32(&votes[server], rejectedVote)
+				rf.logger.Printf("electing, send RequestVote req to %d, term: %d canceled", server, args.Term)
+				return
 			}
 		}(ind, &args)
 	}
 	var granted int
-	var done int
+	var finished int
 	var maxTerm int
 	elected := false
 	majority := len(votes)/2 + 1
 	for !rf.killed() {
 		granted = 0
-		done = 0
+		finished = 0
 		maxTerm = rf.currentTerm
 		for i := 0; i < len(votes); i++ {
 			peerTerm := int(atomic.LoadInt32(&votes[i]))
@@ -500,7 +507,7 @@ func (rf *Raft) elect() bool {
 				granted++
 			}
 			if peerTerm >= 0 || peerTerm == rejectedVote {
-				done++
+				finished++
 			}
 		}
 		if maxTerm > rf.currentTerm {
@@ -510,7 +517,7 @@ func (rf *Raft) elect() bool {
 			elected = true
 			break
 		}
-		if done == len(votes) {
+		if finished == len(votes) {
 			break
 		}
 		time.Sleep(time.Millisecond * 3)
@@ -522,8 +529,8 @@ func (rf *Raft) elect() bool {
 	if maxTerm > rf.currentTerm {
 		rf.currentTerm = maxTerm
 	}
-	rf.logger.Printf("electing, majority: %d, yes: %d, done: %d, term: (%d -> %d), success:%v",
-		majority, granted, done, term, maxTerm, elected)
+	rf.logger.Printf("electing, majority: %d, yes: %d, finished: %d, term: (%d -> %d), success:%v",
+		majority, granted, finished, term, maxTerm, elected)
 
 	return elected
 }
@@ -540,7 +547,7 @@ func (rf *Raft) declareLeadership() {
 		rf.matchIndex[peer] = 0
 	}
 	rf.leaderId = rf.me
-	rf.done = make(chan struct{})
+	rf.doneCh = make(chan struct{})
 	rf.mu.Unlock()
 
 	for i := range rf.peers {
@@ -571,7 +578,7 @@ func (rf *Raft) declareLeadership() {
 					// T6 s0 send heart to s2 in a g2, s0 will get resp
 					//    and s2 can get chance to update it's state.
 					go rf.heartbeatTo(server)
-				case <-rf.done:
+				case <-rf.doneCh:
 					timer.Stop()
 					rf.logger.Printf("yielding, terminate heartbeat for %d", server)
 					return // convert to follower, terminate heartbeat processor
@@ -599,22 +606,16 @@ func (rf *Raft) heartbeatTo(server int) {
 	}
 	reply := AppendEntryReply{}
 
-	retry(func() bool {
-		rf.logger.Printf("send heartbeat req %d to %d, term: %d", seq, server, currentTerm)
-		ok := rf.sendAppendEntry(server, &args, &reply)
-		rf.logger.Printf("send heartbeat %d to %d, term: %d, pterm: %d, ok: %v",
-			seq, server, currentTerm, reply.Term, ok)
-		if reply.Term > currentTerm {
-			return false // retry couple times before step down on the leadership
-		}
-		return true
-	}, 3, time.Millisecond*50)
+	rf.logger.Printf("send heartbeat req %d to %d, term: %d", seq, server, currentTerm)
+	ok := rf.sendAppendEntry(server, &args, &reply)
+	rf.logger.Printf("send heartbeat %d to %d, term: %d, pterm: %d, ok: %v",
+		seq, server, currentTerm, reply.Term, ok)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
 		// step down on the leadership
-		rf.foundHigherTerm(invalidId, reply.Term, "heartbeat resp")
+		rf.convertToFollower(invalidId, reply.Term, "heartbeat resp")
 	}
 }
 
@@ -655,7 +656,7 @@ func (rf *Raft) replicateTo(server, index, commitIndex int, stop chan struct{}) 
 		case reply := <-ch:
 			if reply.Term > rf.currentTerm {
 				rf.mu.Lock()
-				rf.foundHigherTerm(invalidId, reply.Term, "ae resp")
+				rf.convertToFollower(invalidId, reply.Term, "ae resp")
 				rf.mu.Unlock()
 				return false
 			}
@@ -666,7 +667,7 @@ func (rf *Raft) replicateTo(server, index, commitIndex int, stop chan struct{}) 
 			atomic.AddInt64(&rf.nextIndex[server], invalidId)
 		case <-timer.C:
 			rf.logger.Printf("replicate, send ae req to %d, index: %d timeout", server, index)
-		case <-rf.done:
+		case <-rf.doneCh:
 			timer.Stop()
 			rf.logger.Printf("replicate, terminate ae req to %d", server)
 			return false
@@ -697,25 +698,25 @@ func (rf *Raft) last() (index, term int) {
 	return
 }
 
-func (rf *Raft) foundHigherTerm(leaderId, pterm int, reason string) bool {
-	if pterm < rf.currentTerm {
+func (rf *Raft) convertToFollower(leaderId, pterm int, reason string) bool {
+	term := rf.currentTerm
+	if pterm < term {
 		return false
 	}
 
-	term := rf.currentTerm
 	rf.currentTerm = pterm
-
 	rf.votedFor = invalidId
 
 	if rf.me != rf.leaderId {
-		rf.electionTimerResetCh <- struct{}{}
+		// notify any candidate task to terminate
+		rf.followerCh <- struct{}{}
 		return false
 	}
 	rf.leaderId = leaderId
 	rf.logger.Printf("yielding, converting to follower, curTerm: %d -> %d, leader: %d, %v", term, pterm, leaderId, reason)
 
 	// notify any leader task to terminate
-	close(rf.done)
+	close(rf.doneCh)
 
 	return true
 }
@@ -744,9 +745,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 
 	rf.leaderId = invalidId
+	rf.followerCh = make(chan struct{})
 
 	rf.applyCh = applyCh
-	rf.electionTimerResetCh = make(chan struct{})
 	rf.logger = log.New(
 		os.Stderr,
 		fmt.Sprintf("server/%d ", me),
@@ -760,15 +761,4 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
-}
-
-func retry(fn func() bool, maxRetries int, retryInterval time.Duration) bool {
-	var ok bool
-	for i := 0; i < maxRetries; i++ {
-		if ok = fn(); ok {
-			return ok // retry until get true return value or exceeded the max retry limit
-		}
-		time.Sleep(retryInterval)
-	}
-	return ok
 }
