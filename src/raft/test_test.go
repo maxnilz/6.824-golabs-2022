@@ -23,7 +23,10 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestCh(t *testing.T) {
 
-	ch := make(chan bool)
+	var ch chan bool
+	// close(ch) // panic: cannot close a nil channel
+
+	ch = make(chan bool)
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
@@ -59,6 +62,7 @@ func TestCh(t *testing.T) {
 	ch <- true
 	ch <- true
 	close(ch)
+	// close(ch) // panic: close a closed channel
 
 	wg.Wait()
 }

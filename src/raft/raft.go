@@ -226,6 +226,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		return
 	}
+	term := rf.currentTerm
+	if args.Term > term {
+		rf.convertToFollower(invalidId, args.Term, fmt.Sprintf("rv req, candidate: %d", args.CandidateId))
+	}
 
 	lastLogIndex, lastLogTerm := rf.last()
 	isAllowedCandidate := rf.votedFor == invalidId || rf.votedFor == args.CandidateId
@@ -242,16 +246,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if isAllowedCandidate && isUpToDate() {
 		voteGranted = true
 	}
-	if voteGranted {
-		reply.VoteGranted = true
-		reply.Term = rf.currentTerm
-		rf.votedFor = args.CandidateId
-	}
 
-	term := rf.currentTerm
-	if voteGranted || args.Term > term {
-		rf.convertToFollower(invalidId, args.Term, fmt.Sprintf("rv req, candidate: %d", args.CandidateId))
+	if voteGranted {
+		rf.votedFor = args.CandidateId
+		rf.followerCh <- struct{}{}
 	}
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = voteGranted
+
 	rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d -> %d, votedFor: %d, allow: %v, uptodate: %v, granted: %v",
 		args.CandidateId, args.Term, term, rf.currentTerm, rf.votedFor, isAllowedCandidate, isUpToDate(), voteGranted)
 }
@@ -325,15 +327,15 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	rf.logger.Printf("AppendEntry, leader: %d, args.term: %d, curTerm: %d", args.LeaderId, args.Term, rf.currentTerm)
 	reply.Success = true
-	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		// reply false if term < currentTerm
 		reply.Success = false
-		return
 	}
 	if reply.Success || args.Term > rf.currentTerm {
 		rf.convertToFollower(args.LeaderId, args.Term, "ae req")
 	}
+
+	reply.Term = rf.currentTerm
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -621,7 +623,7 @@ func (rf *Raft) heartbeatTo(server int) {
 
 func (rf *Raft) replicate() {}
 
-func (rf *Raft) replicateTo(server, index, commitIndex int, stop chan struct{}) bool {
+func (rf *Raft) replicateTo(server, index, commitIndex int, cancel chan struct{}) bool {
 	timeout := time.Millisecond * roundTripMs
 	for !rf.killed() {
 		nextIndex := int(atomic.LoadInt64(&rf.nextIndex[server]))
@@ -671,7 +673,7 @@ func (rf *Raft) replicateTo(server, index, commitIndex int, stop chan struct{}) 
 			timer.Stop()
 			rf.logger.Printf("replicate, terminate ae req to %d", server)
 			return false
-		case <-stop:
+		case <-cancel:
 			return false
 		}
 	}
@@ -698,14 +700,18 @@ func (rf *Raft) last() (index, term int) {
 	return
 }
 
+// convert myself to follower by stop any leader tasks.
+// if I'm already a follower, reset any candidate task.
 func (rf *Raft) convertToFollower(leaderId, pterm int, reason string) bool {
 	term := rf.currentTerm
 	if pterm < term {
 		return false
 	}
 
-	rf.currentTerm = pterm
-	rf.votedFor = invalidId
+	if pterm > rf.currentTerm {
+		rf.currentTerm = pterm
+		rf.votedFor = invalidId
+	}
 
 	if rf.me != rf.leaderId {
 		// notify any candidate task to terminate
@@ -745,7 +751,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 
 	rf.leaderId = invalidId
-	rf.followerCh = make(chan struct{})
+	rf.followerCh = make(chan struct{}, 3)
 
 	rf.applyCh = applyCh
 	rf.logger = log.New(
