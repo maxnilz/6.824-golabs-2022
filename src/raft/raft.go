@@ -325,16 +325,51 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.logger.Printf("AppendEntry, leader: %d, args.term: %d, curTerm: %d", args.LeaderId, args.Term, rf.currentTerm)
-	reply.Success = true
+	defer func() {
+		rf.logger.Printf("AppendEntry, leader: %d, args.term: %d, curTerm: %d, #entry: %d, prev: %d, %d, ok: %v",
+			args.LeaderId, args.Term, rf.currentTerm, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm, reply.Success)
+	}()
+
 	if args.Term < rf.currentTerm {
 		// reply false if term < currentTerm
 		reply.Success = false
-	}
-	if reply.Success || args.Term > rf.currentTerm {
-		rf.convertToFollower(args.LeaderId, args.Term, "ae req")
+		reply.Term = rf.currentTerm
+		return
 	}
 
+	if len(args.Entries) > 0 {
+		if args.PrevLogIndex == 0 {
+			reply.Success = true
+			rf.log = append(rf.log, args.Entries...)
+		} else if args.PrevLogIndex >= len(rf.log) {
+			reply.Success = false
+		} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.Success = false
+		} else {
+			reply.Success = true
+			rf.log = rf.log[:args.PrevLogIndex+1]
+			rf.log = append(rf.log, args.Entries...)
+		}
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		commitIndex := args.LeaderCommit
+		if commitIndex > len(rf.log)-1 {
+			commitIndex = len(rf.log) - 1
+		}
+		for i := rf.lastApplied + 1; i <= commitIndex; i++ {
+			entry := rf.log[i]
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: i,
+			}
+			rf.lastApplied++
+			rf.logger.Printf("AppendEntry, applied command at %d", rf.lastApplied)
+		}
+	}
+
+	rf.convertToFollower(args.LeaderId, args.Term, "ae req")
 	reply.Term = rf.currentTerm
 }
 
@@ -356,16 +391,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	//rf.mu.Lock()
-	//term = rf.currentTerm
-	//isLeader = rf.leaderId == rf.me
-	//rf.mu.Unlock()
-	//
-	//if !isLeader {
-	//	return index, term, isLeader
-	//}
-	//
-	//index = rf.appendCommand(command)
+	rf.mu.Lock()
+	term = rf.currentTerm
+	isLeader = rf.leaderId == rf.me
+	rf.mu.Unlock()
+
+	if !isLeader {
+		return index, term, isLeader
+	}
+
+	rf.mu.Lock()
+	entry := Entry{
+		Command: command,
+		Term:    rf.currentTerm,
+	}
+	rf.log = append(rf.log, entry)
+	index = len(rf.log) - 1
+	rf.mu.Unlock()
+
+	rf.logger.Printf("Start, command %v at index: %d, term: %d", command, index, rf.currentTerm)
 
 	return index, term, isLeader
 }
@@ -540,10 +584,7 @@ func (rf *Raft) elect(cancel chan struct{}) bool {
 func (rf *Raft) declareLeadership() {
 	rf.mu.Lock()
 	rf.logger.Printf("electing, elected as leader for term: %d", rf.currentTerm)
-	nextIndex := 0
-	if len(rf.log) > 0 {
-		nextIndex = len(rf.log)
-	}
+	nextIndex := len(rf.log)
 	for peer := range rf.peers {
 		rf.nextIndex[peer] = int64(nextIndex)
 		rf.matchIndex[peer] = 0
@@ -588,13 +629,14 @@ func (rf *Raft) declareLeadership() {
 			}
 		}(i)
 	}
+
+	go rf.replicate()
 }
 
 func (rf *Raft) heartbeatTo(server int) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	commitIndex := rf.commitIndex
-	lastLogIndex, lastLogTerm := rf.last()
 	rf.heartbeats++
 	seq := rf.heartbeats
 	rf.mu.Unlock()
@@ -602,8 +644,6 @@ func (rf *Raft) heartbeatTo(server int) {
 	args := AppendEntryArgs{
 		LeaderId:     rf.me,
 		Term:         currentTerm,
-		PrevLogIndex: lastLogIndex,
-		PrevLogTerm:  lastLogTerm,
 		LeaderCommit: commitIndex,
 	}
 	reply := AppendEntryReply{}
@@ -621,28 +661,139 @@ func (rf *Raft) heartbeatTo(server int) {
 	}
 }
 
-func (rf *Raft) replicate() {}
+func (rf *Raft) replicate() {
+	var prev int
+	cancel := make(chan struct{})
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.me != rf.leaderId {
+			close(cancel)
+			rf.mu.Unlock()
+			break // not leader anymore
+		}
+		index, _ := rf.last()
+		rf.mu.Unlock()
+		if index == prev {
+			time.Sleep(time.Millisecond)
+			continue
+		}
 
-func (rf *Raft) replicateTo(server, index, commitIndex int, cancel chan struct{}) bool {
+		rf.logger.Printf("replicate, === index %d -> %d ===", prev, index)
+
+		// notify any pending replicate task to quit
+		// and start a new replicate with the new index
+		close(cancel)
+		cancel = make(chan struct{})
+
+		ok := rf.replicateToAll(index, cancel)
+		if !ok {
+			continue
+		}
+		rf.mu.Lock()
+		rf.commitIndex = index
+		rf.mu.Unlock()
+		for i := rf.lastApplied + 1; i <= index; i++ {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			}
+			rf.lastApplied++
+			rf.logger.Printf("replicate, applied command at %d", rf.lastApplied)
+		}
+		prev = index
+	}
+}
+
+// replicateToAll logs that up to index to all peers, return
+// true immediately if majority replicated, and if there is
+// any un-responded or failed replicate request, they will
+// still continue to retry until the cancel channel is closed.
+// i.e, this replicateAll will guarantee it will always return
+// true, otherwise the cancel channel is closed.
+func (rf *Raft) replicateToAll(index int, cancel chan struct{}) bool {
+	const true_ = 1
+	var success int64
+	ans := make([]int64, len(rf.peers))
+	for peer := range rf.peers {
+		if peer == rf.me {
+			ans[peer] = true_
+			atomic.AddInt64(&success, 1)
+			continue
+		}
+		go func(server int) {
+			ch := make(chan bool)
+			go func() {
+				ok := rf.replicateTo(server, index, cancel)
+				ch <- ok
+			}()
+			select {
+			case ok := <-ch:
+				if ok {
+					atomic.StoreInt64(&ans[server], true_)
+					atomic.AddInt64(&success, 1)
+				}
+			case <-cancel:
+				return
+			case <-rf.doneCh:
+				return
+			}
+		}(peer)
+	}
+
+	done := make(chan bool)
+	majority := len(rf.peers)/2 + 1
+	res := make([]int64, len(rf.peers))
+
+	go func() {
+		for !rf.killed() {
+			select {
+			case <-time.After(time.Millisecond):
+				if atomic.LoadInt64(&success) >= int64(majority) {
+					for peer := range rf.peers {
+						res[peer] = atomic.LoadInt64(&ans[peer])
+					}
+					done <- true
+					return
+				}
+			case <-cancel:
+				done <- false
+				return
+			case <-rf.doneCh:
+				done <- false
+				return
+			}
+		}
+	}()
+
+	ok := <-done
+	n := atomic.LoadInt64(&success)
+	rf.logger.Printf("replicate, replicateToAll %d, success: %d, ans: %v, ok: %v", index, n, res, ok)
+	return ok
+}
+
+func (rf *Raft) replicateTo(server, index int, cancel chan struct{}) bool {
+	ind := index
 	timeout := time.Millisecond * roundTripMs
 	for !rf.killed() {
 		nextIndex := int(atomic.LoadInt64(&rf.nextIndex[server]))
 		if index > nextIndex {
 			index = nextIndex
 		}
+		rf.mu.Lock()
+		currentTerm := rf.currentTerm
+		commitIndex := rf.commitIndex
 		entries := rf.log[index:]
 		prevLogIndex := index - 1
-		prevLogTerm := 0
-		if prevLogIndex >= 0 {
-			prevLogTerm = rf.log[prevLogIndex].Term
-		}
+		prevLogTerm := rf.log[prevLogIndex].Term
+		rf.mu.Unlock()
 		args := &AppendEntryArgs{
-			Term:         rf.currentTerm,
+			Term:         currentTerm,
 			LeaderId:     rf.me,
-			LeaderCommit: commitIndex,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 			Entries:      entries,
+			LeaderCommit: commitIndex,
 		}
 
 		timer := time.NewTimer(timeout)
@@ -650,7 +801,7 @@ func (rf *Raft) replicateTo(server, index, commitIndex int, cancel chan struct{}
 
 		go func() {
 			reply := &AppendEntryReply{}
-			rf.logger.Printf("replicate, send ae req to %d, index: %d", server, index)
+			rf.logger.Printf("replicate, send ae req to %d, index: %d(%d)", server, index, ind)
 			rf.sendAppendEntry(server, args, reply)
 			ch <- reply
 		}()
@@ -663,38 +814,30 @@ func (rf *Raft) replicateTo(server, index, commitIndex int, cancel chan struct{}
 				return false
 			}
 			if reply.Success {
-				rf.logger.Printf("replicate, send ae to %d, index: %d success", server, index)
+				rf.logger.Printf("replicate, send ae to %d, index: %d(%d) success", server, index, ind)
+				atomic.StoreInt64(&rf.nextIndex[server], int64(index+1))
 				return true
 			}
-			atomic.AddInt64(&rf.nextIndex[server], invalidId)
+
+			atomic.AddInt64(&rf.nextIndex[server], -1)
+			// make sure the minimum nextIndex is at least 1 after the decrement
+			atomic.CompareAndSwapInt64(&rf.nextIndex[server], 0, 1)
 		case <-timer.C:
-			rf.logger.Printf("replicate, send ae req to %d, index: %d timeout", server, index)
+			rf.logger.Printf("replicate, send ae req to %d, index: %d(%d) timeout", server, index, ind)
+		case <-cancel:
+			timer.Stop()
+			rf.logger.Printf("replicate, cancel ae req to %d", server)
+			return false
 		case <-rf.doneCh:
 			timer.Stop()
 			rf.logger.Printf("replicate, terminate ae req to %d", server)
-			return false
-		case <-cancel:
 			return false
 		}
 	}
 	return false
 }
 
-func (rf *Raft) appendCommand(command interface{}) int {
-	entry := Entry{
-		Command: command,
-		Term:    rf.currentTerm,
-	}
-
-	rf.log = append(rf.log, entry)
-
-	return len(rf.log) - 1
-}
-
 func (rf *Raft) last() (index, term int) {
-	if len(rf.log) == 0 {
-		return
-	}
 	index = len(rf.log) - 1
 	term = rf.log[index].Term
 	return
@@ -747,6 +890,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.votedFor = invalidId
 
+	// leave index 0 unused, first log index is 1
+	rf.log = make([]Entry, 1)
 	rf.nextIndex = make([]int64, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
