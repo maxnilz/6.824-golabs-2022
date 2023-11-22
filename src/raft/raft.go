@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -83,6 +85,13 @@ type Raft struct {
 	// machine, and term when entry was received by leader
 	// (first index is 1)
 	log []Entry
+	// index of the highest log entry that's reflected in the snapshot
+	// the service says it has created a snapshot that has
+	// all info up to and including index. this means the
+	// service no longer needs the log through (and including)
+	// that index.
+	lastSnapshotIndex int
+	lastSnapshotTerm  int
 
 	//
 	// volatile state on all servers
@@ -100,7 +109,7 @@ type Raft struct {
 	//
 	// for each server, index of next log entry to send that server
 	// initialized to leader last log index + 1
-	nextIndex []int64
+	nextIndex []int
 	// for each server, index of highest log entry known to be replicated
 	// on server, initialized to 0, increases monotonically
 	matchIndex []int
@@ -140,7 +149,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-func (rf *Raft) persist() {
+func (rf *Raft) persist(index int, snapshot []byte) {
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -149,6 +158,42 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := bytes.Buffer{}
+	a := labgob.NewEncoder(&w)
+	if err := a.Encode(rf.currentTerm); err != nil {
+		rf.logger.Printf("persist, encode currentTerm failed")
+	}
+	if err := a.Encode(rf.votedFor); err != nil {
+		rf.logger.Printf("persist, encode votedFor failed")
+	}
+	var entries []Entry
+	lastIndex, _ := rf.last()
+	if index < lastIndex {
+		// index here is included in the snapshot,
+		// however, the first item in the log array
+		// is not used and the first valid log index
+		// is 1, so we are using rf.log[ind:] to trim
+		// the remaining logs
+		ind := rf.index2ind(index)
+		entries = rf.log[ind:]
+	}
+	if err := a.Encode(entries); err != nil {
+		rf.logger.Printf("persist, encode log failed")
+	}
+	if err := a.Encode(rf.commitIndex); err != nil {
+		rf.logger.Printf("persist, encode commitIndex failed")
+	}
+	if err := a.Encode(rf.lastApplied); err != nil {
+		rf.logger.Printf("persist, encode lastApplied failed")
+	}
+	if err := a.Encode(rf.lastSnapshotIndex); err != nil {
+		rf.logger.Printf("persist, encode lastSnapshotIndex failed")
+	}
+	if err := a.Encode(rf.lastSnapshotTerm); err != nil {
+		rf.logger.Printf("persist, encode lastSnapshotTerm failed")
+	}
+	data := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 // restore previously persisted state.
@@ -169,6 +214,29 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	a := labgob.NewDecoder(r)
+	if err := a.Decode(&rf.currentTerm); err != nil {
+		rf.logger.Printf("persist, decode currentTerm failed")
+	}
+	if err := a.Decode(&rf.votedFor); err != nil {
+		rf.logger.Printf("persist, decode votedFor failed")
+	}
+	if err := a.Decode(&rf.log); err != nil {
+		rf.logger.Printf("persist, decode log failed")
+	}
+	if err := a.Decode(&rf.commitIndex); err != nil {
+		rf.logger.Printf("persist, decode commitIndex failed")
+	}
+	if err := a.Decode(&rf.lastApplied); err != nil {
+		rf.logger.Printf("persist, decode lastApplied failed")
+	}
+	if err := a.Decode(&rf.lastSnapshotIndex); err != nil {
+		rf.logger.Printf("persist, decode lastSnapshotIndex failed")
+	}
+	if err := a.Decode(&rf.lastSnapshotTerm); err != nil {
+		rf.logger.Printf("persist, decode lastSnapshotTerm failed")
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -186,7 +254,15 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	rf.lastSnapshotIndex = index
+	ind := rf.index2ind(index)
+	entry := rf.log[ind]
+	rf.lastSnapshotTerm = entry.Term
+
+	rf.persist(ind+1, snapshot)
 }
 
 // example RequestVote RPC arguments structure.
@@ -228,7 +304,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	term := rf.currentTerm
 	if args.Term > term {
-		rf.convertToFollower(invalidId, args.Term, fmt.Sprintf("rv req, candidate: %d", args.CandidateId))
+		rf.convertToFollower(invalidId, args.Term, fmt.Sprintf("rv req, candidate: %d", args.CandidateId), false)
 	}
 
 	lastLogIndex, lastLogTerm := rf.last()
@@ -254,6 +330,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = voteGranted
 
+	rf.persist(0, nil)
 	rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d -> %d, votedFor: %d, allow: %v, uptodate: %v, granted: %v",
 		args.CandidateId, args.Term, term, rf.currentTerm, rf.votedFor, isAllowedCandidate, isUpToDate(), voteGranted)
 }
@@ -325,51 +402,72 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	defer func() {
-		rf.logger.Printf("AppendEntry, leader: %d, args.term: %d, curTerm: %d, #entry: %d, prev: %d, %d, ok: %v",
-			args.LeaderId, args.Term, rf.currentTerm, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm, reply.Success)
-	}()
-
+	lastIndex, _ := rf.last()
 	if args.Term < rf.currentTerm {
 		// reply false if term < currentTerm
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		rf.logger.Printf("AppendEntry, false, leader: %d, args.term: %d, curTerm: %d, "+
+			"lastIndex: %d, #log: %d, #args.entry: %d, prev: %d-%d",
+			args.LeaderId, args.Term, rf.currentTerm,
+			lastIndex, len(rf.log)-1, len(args.Entries),
+			args.PrevLogIndex, args.PrevLogTerm)
 		return
 	}
 
-	if len(args.Entries) > 0 {
-		if args.PrevLogIndex == 0 {
-			reply.Success = true
-			rf.log = append(rf.log, args.Entries...)
-		} else if args.PrevLogIndex >= len(rf.log) {
-			reply.Success = false
-		} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			reply.Success = false
-		} else {
-			reply.Success = true
-			rf.log = rf.log[:args.PrevLogIndex+1]
-			rf.log = append(rf.log, args.Entries...)
-		}
-	}
-
-	if args.LeaderCommit > rf.commitIndex {
-		commitIndex := args.LeaderCommit
-		if commitIndex > len(rf.log)-1 {
-			commitIndex = len(rf.log) - 1
-		}
-		for i := rf.lastApplied + 1; i <= commitIndex; i++ {
-			entry := rf.log[i]
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      entry.Command,
-				CommandIndex: i,
+	acceptable := func() bool {
+		if args.PrevLogIndex != 0 {
+			if args.PrevLogIndex > lastIndex {
+				return false
 			}
-			rf.lastApplied++
-			rf.logger.Printf("AppendEntry, applied command at %d", rf.lastApplied)
+			entry, ok := rf.get(args.PrevLogIndex)
+			if !ok {
+				return false
+			}
+			if entry.Term != args.PrevLogTerm {
+				return false
+			}
 		}
+		return true
 	}
 
-	rf.convertToFollower(args.LeaderId, args.Term, "ae req")
+	reply.Success = false
+	if acceptable() {
+		reply.Success = true
+		ind := rf.index2ind(args.PrevLogIndex)
+		rf.log = rf.log[:ind+1]
+		rf.log = append(rf.log, args.Entries...)
+	}
+
+	rf.logger.Printf("AppendEntry, %v, leader: %d, args.term: %d, curTerm: %d, "+
+		"lastIndex: %d, #log:%d, #args.entry: %d, prev: %d-%d, commit index: %d-%d",
+		reply.Success, args.LeaderId, args.Term, rf.currentTerm,
+		lastIndex, len(rf.log)-1, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm,
+		args.LeaderCommit, rf.commitIndex)
+
+	if reply.Success && args.LeaderCommit > rf.commitIndex {
+		commitIndex := args.LeaderCommit
+		if commitIndex > lastIndex {
+			commitIndex = lastIndex
+		}
+		rf.commitIndex = commitIndex
+	}
+
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		ind := rf.index2ind(i)
+		entry := rf.log[ind]
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      entry.Command,
+			CommandIndex: i,
+		}
+		rf.lastApplied++
+		rf.logger.Printf("AppendEntry, applied command: %v at %d(%d), term: %d, lastApplied:%d, commitIndex: %d",
+			entry.Command, i, ind, entry.Term, rf.lastApplied, rf.commitIndex)
+	}
+
+	rf.convertToFollower(args.LeaderId, args.Term, "ae req", false)
+	rf.persist(0, nil)
 	reply.Term = rf.currentTerm
 }
 
@@ -406,7 +504,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 	}
 	rf.log = append(rf.log, entry)
-	index = len(rf.log) - 1
+	index, _ = rf.last()
+	rf.persist(0, nil)
 	rf.mu.Unlock()
 
 	rf.logger.Printf("Start, command %v at index: %d, term: %d", command, index, rf.currentTerm)
@@ -482,8 +581,10 @@ func (rf *Raft) elect(cancel chan struct{}) bool {
 	if rf.me == rf.leaderId {
 		return false // already a leader, do nothing
 	}
-	rf.currentTerm++ // increase the term
+	rf.currentTerm++    // increase the term
+	rf.votedFor = rf.me // vote itself first
 	rf.leaderId = invalidId
+	rf.persist(0, nil)
 
 	votes := make([]int32, len(rf.peers))
 	for i := range votes {
@@ -494,8 +595,7 @@ func (rf *Raft) elect(cancel chan struct{}) bool {
 	rf.logger.Printf("electing, gathering votes for term: %d", rf.currentTerm)
 
 	for ind := range rf.peers {
-		if ind == rf.me { // vote itself first
-			rf.votedFor = rf.me
+		if ind == rf.me { // voted itself
 			votes[ind] = int32(rf.currentTerm)
 			continue
 		}
@@ -575,6 +675,7 @@ func (rf *Raft) elect(cancel chan struct{}) bool {
 	if maxTerm > rf.currentTerm {
 		rf.currentTerm = maxTerm
 	}
+	rf.persist(0, nil)
 	rf.logger.Printf("electing, majority: %d, yes: %d, finished: %d, term: (%d -> %d), success:%v",
 		majority, granted, finished, term, maxTerm, elected)
 
@@ -583,10 +684,13 @@ func (rf *Raft) elect(cancel chan struct{}) bool {
 
 func (rf *Raft) declareLeadership() {
 	rf.mu.Lock()
-	rf.logger.Printf("electing, elected as leader for term: %d", rf.currentTerm)
-	nextIndex := len(rf.log)
+	lastIndex, _ := rf.last()
+	nextIndex := lastIndex + 1
+	rf.logger.Printf("electing, elected as leader for term: %d, "+
+		"commit index: %d, last applied: %d, next index: %d",
+		rf.currentTerm, rf.commitIndex, rf.lastApplied, nextIndex)
 	for peer := range rf.peers {
-		rf.nextIndex[peer] = int64(nextIndex)
+		rf.nextIndex[peer] = nextIndex
 		rf.matchIndex[peer] = 0
 	}
 	rf.leaderId = rf.me
@@ -637,13 +741,17 @@ func (rf *Raft) heartbeatTo(server int) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	commitIndex := rf.commitIndex
+	index, term := rf.last()
 	rf.heartbeats++
 	seq := rf.heartbeats
+
 	rf.mu.Unlock()
 
 	args := AppendEntryArgs{
 		LeaderId:     rf.me,
 		Term:         currentTerm,
+		PrevLogIndex: index,
+		PrevLogTerm:  term,
 		LeaderCommit: commitIndex,
 	}
 	reply := AppendEntryReply{}
@@ -657,7 +765,7 @@ func (rf *Raft) heartbeatTo(server int) {
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
 		// step down on the leadership
-		rf.convertToFollower(invalidId, reply.Term, "heartbeat resp")
+		rf.convertToFollower(invalidId, reply.Term, "heartbeat resp", true)
 	}
 }
 
@@ -672,8 +780,10 @@ func (rf *Raft) replicate() {
 			break // not leader anymore
 		}
 		index, _ := rf.last()
+		commitIndex := rf.commitIndex
+		currentTerm := rf.currentTerm
 		rf.mu.Unlock()
-		if index == prev {
+		if index == prev || index <= commitIndex {
 			time.Sleep(time.Millisecond)
 			continue
 		}
@@ -685,22 +795,26 @@ func (rf *Raft) replicate() {
 		close(cancel)
 		cancel = make(chan struct{})
 
-		ok := rf.replicateToAll(index, cancel)
+		ok := rf.replicateToAll(currentTerm, index, cancel)
 		if !ok {
 			continue
 		}
 		rf.mu.Lock()
 		rf.commitIndex = index
-		rf.mu.Unlock()
-		for i := rf.lastApplied + 1; i <= index; i++ {
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			ind := rf.index2ind(i)
+			entry := rf.log[ind]
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[i].Command,
+				Command:      entry.Command,
 				CommandIndex: i,
 			}
 			rf.lastApplied++
-			rf.logger.Printf("replicate, applied command at %d", rf.lastApplied)
+			rf.logger.Printf("replicate, applied command: %v at %d(%d), term: %d, lastApplied:%d, commitIndex: %d",
+				entry.Command, i, ind, entry.Term, rf.lastApplied, rf.commitIndex)
 		}
+		rf.persist(0, nil)
+		rf.mu.Unlock()
 		prev = index
 	}
 }
@@ -711,7 +825,7 @@ func (rf *Raft) replicate() {
 // still continue to retry until the cancel channel is closed.
 // i.e, this replicateAll will guarantee it will always return
 // true, otherwise the cancel channel is closed.
-func (rf *Raft) replicateToAll(index int, cancel chan struct{}) bool {
+func (rf *Raft) replicateToAll(currentTerm, index int, cancel chan struct{}) bool {
 	const true_ = 1
 	var success int64
 	ans := make([]int64, len(rf.peers))
@@ -724,7 +838,7 @@ func (rf *Raft) replicateToAll(index int, cancel chan struct{}) bool {
 		go func(server int) {
 			ch := make(chan bool)
 			go func() {
-				ok := rf.replicateTo(server, index, cancel)
+				ok := rf.replicateTo(currentTerm, server, index, cancel)
 				ch <- ok
 			}()
 			select {
@@ -768,23 +882,23 @@ func (rf *Raft) replicateToAll(index int, cancel chan struct{}) bool {
 
 	ok := <-done
 	n := atomic.LoadInt64(&success)
-	rf.logger.Printf("replicate, replicateToAll %d, success: %d, ans: %v, ok: %v", index, n, res, ok)
+	rf.logger.Printf("replicate, term: %d upto: %d, success: %d, ans: %v, ok: %v", currentTerm, index, n, res, ok)
 	return ok
 }
 
-func (rf *Raft) replicateTo(server, index int, cancel chan struct{}) bool {
-	ind := index
+func (rf *Raft) replicateTo(currentTerm, server, index int, cancel chan struct{}) bool {
+	start := index
+	end := index + 1
 	timeout := time.Millisecond * roundTripMs
 	for !rf.killed() {
-		nextIndex := int(atomic.LoadInt64(&rf.nextIndex[server]))
-		if index > nextIndex {
-			index = nextIndex
-		}
 		rf.mu.Lock()
-		currentTerm := rf.currentTerm
+		nextIndex := rf.nextIndex[server]
+		if start > nextIndex {
+			start = nextIndex
+		}
 		commitIndex := rf.commitIndex
-		entries := rf.log[index:]
-		prevLogIndex := index - 1
+		entries := rf.log[start:end]
+		prevLogIndex := start - 1
 		prevLogTerm := rf.log[prevLogIndex].Term
 		rf.mu.Unlock()
 		args := &AppendEntryArgs{
@@ -801,29 +915,35 @@ func (rf *Raft) replicateTo(server, index int, cancel chan struct{}) bool {
 
 		go func() {
 			reply := &AppendEntryReply{}
-			rf.logger.Printf("replicate, send ae req to %d, index: %d(%d)", server, index, ind)
+			rf.logger.Printf("replicate, send ae req to %d, index: %d-%d(%d), prev: %d-%d",
+				server, start, end, len(entries), prevLogIndex, prevLogTerm)
 			rf.sendAppendEntry(server, args, reply)
 			ch <- reply
 		}()
 		select {
 		case reply := <-ch:
+			rf.mu.Lock()
 			if reply.Term > rf.currentTerm {
-				rf.mu.Lock()
-				rf.convertToFollower(invalidId, reply.Term, "ae resp")
+				rf.convertToFollower(invalidId, reply.Term, "ae resp", true)
 				rf.mu.Unlock()
 				return false
 			}
 			if reply.Success {
-				rf.logger.Printf("replicate, send ae to %d, index: %d(%d) success", server, index, ind)
-				atomic.StoreInt64(&rf.nextIndex[server], int64(index+1))
+				rf.logger.Printf("replicate, send ae req to %d, index: %d-%d(%d), prev: %d-%d success",
+					server, start, end, len(entries), prevLogIndex, prevLogTerm)
+				rf.nextIndex[server] = end
+				rf.matchIndex[server] = end - 1
+				rf.mu.Unlock()
 				return true
 			}
 
-			atomic.AddInt64(&rf.nextIndex[server], -1)
-			// make sure the minimum nextIndex is at least 1 after the decrement
-			atomic.CompareAndSwapInt64(&rf.nextIndex[server], 0, 1)
+			if rf.nextIndex[server] > 1 {
+				// make sure the minimum nextIndex is at least 1 after the decrement
+				rf.nextIndex[server]--
+			}
+			rf.mu.Unlock()
 		case <-timer.C:
-			rf.logger.Printf("replicate, send ae req to %d, index: %d(%d) timeout", server, index, ind)
+			rf.logger.Printf("replicate, send ae req to %d, index: %d-%d(%d) timeout", server, start, end, len(entries))
 		case <-cancel:
 			timer.Stop()
 			rf.logger.Printf("replicate, cancel ae req to %d", server)
@@ -837,15 +957,39 @@ func (rf *Raft) replicateTo(server, index int, cancel chan struct{}) bool {
 	return false
 }
 
+func (rf *Raft) get(index int) (Entry, bool) {
+	if index <= rf.lastSnapshotIndex {
+		return Entry{}, false
+	}
+	ind := rf.index2ind(index)
+	return rf.log[ind], true
+}
+
+func (rf *Raft) set(index int, entry Entry) {
+	ind := rf.index2ind(index)
+	rf.log[ind] = entry
+}
+
 func (rf *Raft) last() (index, term int) {
-	index = len(rf.log) - 1
-	term = rf.log[index].Term
-	return
+	if len(rf.log) == 1 && rf.lastSnapshotIndex != 0 {
+		return rf.lastSnapshotIndex, rf.lastSnapshotTerm
+	}
+	ind := len(rf.log) - 1
+	lastTerm := rf.log[ind].Term
+	lastIndex := rf.lastSnapshotIndex + ind
+	return lastIndex, lastTerm
+}
+
+func (rf *Raft) index2ind(index int) int {
+	if rf.lastSnapshotIndex == 0 {
+		return index
+	}
+	return index - rf.lastSnapshotIndex
 }
 
 // convert myself to follower by stop any leader tasks.
 // if I'm already a follower, reset any candidate task.
-func (rf *Raft) convertToFollower(leaderId, pterm int, reason string) bool {
+func (rf *Raft) convertToFollower(leaderId, pterm int, reason string, persist bool) bool {
 	term := rf.currentTerm
 	if pterm < term {
 		return false
@@ -854,6 +998,9 @@ func (rf *Raft) convertToFollower(leaderId, pterm int, reason string) bool {
 	if pterm > rf.currentTerm {
 		rf.currentTerm = pterm
 		rf.votedFor = invalidId
+		if persist {
+			rf.persist(0, nil)
+		}
 	}
 
 	if rf.me != rf.leaderId {
@@ -892,7 +1039,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// leave index 0 unused, first log index is 1
 	rf.log = make([]Entry, 1)
-	rf.nextIndex = make([]int64, len(peers))
+	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
 	rf.leaderId = invalidId
