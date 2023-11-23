@@ -103,8 +103,10 @@ type Raft struct {
 	// 0, increases monotonically)
 	lastApplied int
 	// snapshot
-	snapshot        []byte
-	pendingSnapshot *bytes.Buffer
+	snapshot []byte
+
+	pendingSnapshotIndex int
+	pendingSnapshot      *bytes.Buffer
 
 	//
 	// volatile state on leader
@@ -241,13 +243,18 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
-func (rf *Raft) trimLogs(index int) {
+func (rf *Raft) trimLogs(index, term int) {
+	lastIndex, _ := rf.last()
+	if lastIndex < index {
+		rf.log = make([]Entry, 1)
+		rf.lastSnapshotIndex = index
+		rf.lastSnapshotTerm = term
+		rf.logger.Printf("trimLogs, discard all logs, term: %d, index: %d, lastIndex: %d", term, index, lastIndex)
+		return
+	}
 	ind := rf.index2ind(index)
-	entry := rf.log[ind]
-	rf.lastSnapshotIndex = index
-	rf.lastSnapshotTerm = entry.Term
 
-	rf.logger.Printf("trimLogs, term: %d, index:%d, ind:%d, #log:%d", entry.Term, index, ind, len(rf.log)-1)
+	rf.logger.Printf("trimLogs, term: %d, index: %d, ind: %d, #log: %d", term, index, ind, len(rf.log)-1)
 
 	// trim log upto ind(including)
 	logs := make([]Entry, 1)
@@ -259,6 +266,8 @@ func (rf *Raft) trimLogs(index int) {
 	}
 	logs = append(logs, entries...)
 	rf.log = logs
+	rf.lastSnapshotIndex = index
+	rf.lastSnapshotTerm = term
 }
 
 // the service says it has created a snapshot that has
@@ -272,7 +281,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.logger.Printf("Snapshot, curTerm: %d, index: %d", rf.currentTerm, index)
 
-	rf.trimLogs(index)
+	ind := rf.index2ind(index)
+	entry := rf.log[ind]
+	rf.trimLogs(index, entry.Term)
 	rf.persist(snapshot)
 	rf.snapshot = snapshot
 }
@@ -442,11 +453,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			if args.PrevLogIndex > lastIndex {
 				return false
 			}
-			entry, ok := rf.get(args.PrevLogIndex)
+			prevTerm, ok := rf.termOf(args.PrevLogIndex)
 			if !ok {
 				return false
 			}
-			if entry.Term != args.PrevLogTerm {
+			if prevTerm != args.PrevLogTerm {
 				return false
 			}
 		}
@@ -528,41 +539,43 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("InstallSnapshot, rejected, args.Term: %v, curTerm: %v", args.Term, rf.currentTerm)
+		rf.logger.Printf("InstallSnapshot, rejected, leader: %d, args.Term: %v, curTerm: %v",
+			args.LeaderId, args.Term, rf.currentTerm)
 		rf.mu.Unlock()
 		return
 	}
 
-	rf.declareAsFollower(args.LeaderId, args.Term, "snapshot")
+	rf.declareAsFollower(args.LeaderId, args.Term, "install snapshot")
 
-	ind := rf.index2ind(args.LastIncludedIndex)
-	entry := rf.log[ind]
-	if entry.Term != args.LastIncludedTerm {
+	if args.LastIncludedIndex < rf.pendingSnapshotIndex {
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("InstallSnapshot, rejected, lastIndex: %v, lastTerm: %d, actualIndexTerm: %v, curTerm: %v",
-			args.LastIncludedIndex, args.LastIncludedTerm, entry.Term, rf.currentTerm)
+		rf.logger.Printf("InstallSnapshot, rejected, leader: %d, existing newer pending snapshot, index: %d, args.index: %d",
+			args.LeaderId, rf.pendingSnapshotIndex, args.LastIncludedIndex)
 		rf.mu.Unlock()
 		return
 	}
 
 	if args.Offset == 0 {
-		rf.pendingSnapshot.Reset()
+		rf.pendingSnapshot = &bytes.Buffer{}
+		rf.pendingSnapshotIndex = args.LastIncludedIndex
 	}
 	rf.pendingSnapshot.Write(args.Data)
 	if !args.Done {
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("InstallSnapshot, pending, offset: %v, len: %v, curTerm: %v",
-			args.Offset, len(args.Data), rf.currentTerm)
+		rf.logger.Printf("InstallSnapshot, pending, leader: %d, offset: %v, len: %v, curTerm: %v",
+			args.LeaderId, args.Offset, len(args.Data), rf.currentTerm)
 		rf.mu.Unlock()
 		return
 	}
 	reply.Term = rf.currentTerm
-	rf.logger.Printf("InstallSnapshot, accepted, len: %v, curTerm: %v", rf.pendingSnapshot.Len(), rf.currentTerm)
+	snapshot := rf.pendingSnapshot.Bytes()
+	rf.logger.Printf("InstallSnapshot, accepted, leader: %d, len: %v, curTerm: %v, includedIndex: %d, includedTerm: %d",
+		args.LeaderId, len(snapshot), rf.currentTerm, args.LastIncludedIndex, args.LastIncludedTerm)
 	rf.mu.Unlock()
 
 	rf.applyCh <- ApplyMsg{
 		SnapshotValid: true,
-		Snapshot:      rf.pendingSnapshot.Bytes(),
+		Snapshot:      snapshot,
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
@@ -571,9 +584,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if rf.lastApplied < args.LastIncludedIndex {
 		rf.lastApplied = args.LastIncludedIndex
 	}
-	rf.trimLogs(args.LastIncludedIndex)
-	rf.persist(rf.pendingSnapshot.Bytes())
-	rf.snapshot = rf.pendingSnapshot.Bytes()
+	if rf.commitIndex < args.LastIncludedIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+	rf.trimLogs(args.LastIncludedIndex, args.LastIncludedTerm)
+	// set latest snapshot
+	rf.snapshot = snapshot
+	// clean pending snapshot
+	rf.pendingSnapshotIndex = 0
+	rf.pendingSnapshot = &bytes.Buffer{}
+	// persist
+	rf.persist(snapshot)
 	rf.mu.Unlock()
 }
 
@@ -1004,8 +1025,9 @@ func (rf *Raft) replicateTo(currentTerm, server, index int, cancel chan struct{}
 			startIndex = nextIndex
 		}
 		prevLogIndex := startIndex - 1
-		prevEntry, ok := rf.get(prevLogIndex)
+		prevLogTerm, ok := rf.termOf(prevLogIndex)
 		if !ok {
+			// install snapshot
 			args := &InstallSnapshotArgs{
 				Term:              currentTerm,
 				LeaderId:          rf.me,
@@ -1016,15 +1038,15 @@ func (rf *Raft) replicateTo(currentTerm, server, index int, cancel chan struct{}
 				Done:              true,
 			}
 			go func() {
-				rf.logger.Printf("replicate, send snapshot req to %d, lastIndex: %d, lastTerm: %d",
-					server, rf.lastSnapshotIndex, rf.lastSnapshotTerm)
+				rf.logger.Printf("replicate, send snapshot req to %d, lastIndex: %d, lastTerm: %d, start: %d, end: %d, next: %d",
+					server, rf.lastSnapshotIndex, rf.lastSnapshotTerm, startIndex, endIndex, nextIndex)
 
 				reply := &InstallSnapshotReply{}
 				rf.sendInstallSnapshot(server, args, reply)
 				snapshotCh <- reply
 			}()
 		} else {
-			prevLogTerm := prevEntry.Term
+			// regular append entry
 			commitIndex := rf.commitIndex
 			start := rf.index2ind(startIndex)
 			end := rf.index2ind(endIndex)
@@ -1083,13 +1105,16 @@ func (rf *Raft) replicateTo(currentTerm, server, index int, cancel chan struct{}
 			rf.logger.Printf("replicate, send snapshot req to %d, lastIndex: %d, lastTerm: %d success",
 				server, rf.lastSnapshotIndex, rf.lastSnapshotTerm)
 
-			rf.nextIndex[server] = rf.lastSnapshotIndex + 1
+			// update the next index and
+			startIndex = rf.lastSnapshotIndex + 1
+			rf.nextIndex[server] = endIndex
+			// continue the loop for replication if existing
+			// any un-committed entries
 			rf.mu.Unlock()
-			// continue the loop for replication
 		case <-timer.C:
 			rf.logger.Printf("replicate, send ae req to %d, index: %d-%d timeout",
 				server, startIndex, endIndex)
-			// continue the loop for replication
+			// timeout continue the loop for replication
 		case <-cancel:
 			timer.Stop()
 			rf.logger.Printf("replicate, cancel ae req to %d", server)
@@ -1122,12 +1147,15 @@ func (rf *Raft) applyEntry(entries []Entry, commandIndStart, commandIndex int) {
 	}
 }
 
-func (rf *Raft) get(index int) (Entry, bool) {
+func (rf *Raft) termOf(index int) (int, bool) {
 	if rf.lastSnapshotIndex > 0 && index < rf.lastSnapshotIndex {
-		return Entry{}, false
+		return 0, false
+	}
+	if index == rf.lastSnapshotIndex {
+		return rf.lastSnapshotTerm, true
 	}
 	ind := rf.index2ind(index)
-	return rf.log[ind], true
+	return rf.log[ind].Term, true
 }
 
 func (rf *Raft) set(index int, entry Entry) {
@@ -1207,6 +1235,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.leaderId = invalidId
 	rf.followerCh = make(chan struct{}, 3)
+
+	rf.pendingSnapshot = &bytes.Buffer{}
 
 	rf.applyCh = applyCh
 	rf.logger = log.New(
