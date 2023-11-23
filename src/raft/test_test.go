@@ -10,6 +10,7 @@ package raft
 
 import (
 	"testing"
+	"unsafe"
 )
 import "fmt"
 import "time"
@@ -20,6 +21,40 @@ import "sync"
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
+
+func ff(c chan string) {
+	fmt.Printf("ff %p\n", &c)
+	ptr := (*string)(unsafe.Pointer(&c))
+	fmt.Printf("ff data: %p\n", ptr)
+	fmt.Printf("ff data 2: %p\n", &(*ptr))
+}
+
+func TestRef(t *testing.T) {
+	wg := sync.WaitGroup{}
+	ch := make(chan string)
+	fmt.Printf("1 %p\n", &ch)
+	ptr := (*string)(unsafe.Pointer(&ch))
+	fmt.Printf("2: %p\n", ptr)
+	fmt.Printf("3: %p\n", &(*ptr))
+	ff(ch)
+
+	wg.Add(1)
+	go func(c chan string) {
+		defer wg.Done()
+		select {
+		case <-c:
+			fmt.Printf("=== %p\n", &c)
+		}
+	}(ch)
+	time.Sleep(time.Second)
+	close(ch)
+	ch = make(chan string)
+	fmt.Printf("2 %p\n", &ch)
+
+	ch2 := make(chan string)
+	fmt.Printf("%p\n", ch2)
+	wg.Wait()
+}
 
 func TestLock(t *testing.T) {
 	a := sync.Mutex{}

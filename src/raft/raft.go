@@ -811,6 +811,7 @@ func (rf *Raft) elect(cancel chan struct{}) bool {
 
 func (rf *Raft) declareLeadership() {
 	rf.mu.Lock()
+	done := make(chan struct{})
 	lastIndex, _ := rf.last()
 	nextIndex := lastIndex + 1
 	rf.logger.Printf("electing, elected as leader for term: %d, "+
@@ -821,7 +822,7 @@ func (rf *Raft) declareLeadership() {
 		rf.matchIndex[peer] = 0
 	}
 	rf.leaderId = rf.me
-	rf.doneCh = make(chan struct{})
+	rf.doneCh = done
 	rf.mu.Unlock()
 
 	for i := range rf.peers {
@@ -852,7 +853,7 @@ func (rf *Raft) declareLeadership() {
 					// T6 s0 send heart to s2 in a g2, s0 will get resp
 					//    and s2 can get chance to update it's state.
 					go rf.heartbeatTo(server)
-				case <-rf.doneCh:
+				case <-done:
 					timer.Stop()
 					rf.logger.Printf("yielding, terminate heartbeat for %d", server)
 					return // convert to follower, terminate heartbeat processor
@@ -861,7 +862,7 @@ func (rf *Raft) declareLeadership() {
 		}(i)
 	}
 
-	go rf.replicate()
+	go rf.replicate(done)
 }
 
 func (rf *Raft) heartbeatTo(server int) {
@@ -895,7 +896,7 @@ func (rf *Raft) heartbeatTo(server int) {
 	}
 }
 
-func (rf *Raft) replicate() {
+func (rf *Raft) replicate(done <-chan struct{}) {
 	var prev int
 	cancel := make(chan struct{})
 	for !rf.killed() {
@@ -921,7 +922,7 @@ func (rf *Raft) replicate() {
 		close(cancel)
 		cancel = make(chan struct{})
 
-		ok := rf.replicateToAll(currentTerm, index, cancel)
+		ok := rf.replicateToAll(currentTerm, index, cancel, done)
 		if !ok {
 			continue
 		}
@@ -950,7 +951,7 @@ func (rf *Raft) replicate() {
 // still continue to retry until the cancel channel is closed.
 // i.e, this replicateAll will guarantee it will always return
 // true, otherwise the cancel channel is closed.
-func (rf *Raft) replicateToAll(currentTerm, index int, cancel chan struct{}) bool {
+func (rf *Raft) replicateToAll(currentTerm, index int, cancel, done <-chan struct{}) bool {
 	const true_ = 1
 	var success int64
 	ans := make([]int64, len(rf.peers))
@@ -963,7 +964,7 @@ func (rf *Raft) replicateToAll(currentTerm, index int, cancel chan struct{}) boo
 		go func(server int) {
 			ch := make(chan bool)
 			go func() {
-				ok := rf.replicateTo(currentTerm, server, index, cancel)
+				ok := rf.replicateTo(currentTerm, server, index, cancel, done)
 				ch <- ok
 			}()
 			select {
@@ -974,13 +975,13 @@ func (rf *Raft) replicateToAll(currentTerm, index int, cancel chan struct{}) boo
 				}
 			case <-cancel:
 				return
-			case <-rf.doneCh:
+			case <-done:
 				return
 			}
 		}(peer)
 	}
 
-	done := make(chan bool)
+	ch := make(chan bool)
 	majority := len(rf.peers)/2 + 1
 	res := make([]int64, len(rf.peers))
 
@@ -992,26 +993,26 @@ func (rf *Raft) replicateToAll(currentTerm, index int, cancel chan struct{}) boo
 					for peer := range rf.peers {
 						res[peer] = atomic.LoadInt64(&ans[peer])
 					}
-					done <- true
+					ch <- true
 					return
 				}
 			case <-cancel:
-				done <- false
+				ch <- false
 				return
-			case <-rf.doneCh:
-				done <- false
+			case <-done:
+				ch <- false
 				return
 			}
 		}
 	}()
 
-	ok := <-done
+	ok := <-ch
 	n := atomic.LoadInt64(&success)
 	rf.logger.Printf("replicate, term: %d upto: %d, success: %d, ans: %v, ok: %v", currentTerm, index, n, res, ok)
 	return ok
 }
 
-func (rf *Raft) replicateTo(currentTerm, server, index int, cancel chan struct{}) bool {
+func (rf *Raft) replicateTo(currentTerm, server, index int, cancel, done <-chan struct{}) bool {
 	startIndex := index
 	endIndex := index + 1
 	timeout := time.Millisecond * roundTripMs
@@ -1119,7 +1120,7 @@ func (rf *Raft) replicateTo(currentTerm, server, index int, cancel chan struct{}
 			timer.Stop()
 			rf.logger.Printf("replicate, cancel ae req to %d", server)
 			return false
-		case <-rf.doneCh:
+		case <-done:
 			timer.Stop()
 			rf.logger.Printf("replicate, terminate ae req to %d", server)
 			return false
