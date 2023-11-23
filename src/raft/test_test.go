@@ -21,6 +21,13 @@ import "sync"
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
+func TestLock(t *testing.T) {
+	a := sync.Mutex{}
+	a.Lock()
+	a.Unlock()
+	a.Unlock()
+}
+
 func TestCh(t *testing.T) {
 
 	var ch chan bool
