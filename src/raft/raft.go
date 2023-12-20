@@ -20,6 +20,7 @@ package raft
 import (
 	"6.824/labgob"
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -406,7 +407,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		rf.logger.Printf("AppendEntry, false, leader: %d, args.term: %d, curTerm: %d, "+
-			"lastIndex: %d, #log: %d, #args.entry: %d, prev: %d-%d",
+			"lastIndex: %d, #log: %d, #args.entry: %d, prevIndex: %d, prevTerm: %d",
 			args.LeaderId, args.Term, rf.currentTerm,
 			lastIndex, len(rf.log)-1, len(args.Entries),
 			args.PrevLogIndex, args.PrevLogTerm)
@@ -428,17 +429,9 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.persist(nil)
 
 		rf.leaderId = args.LeaderId
-		rf.followerC <- struct{}{}
 	}
 
 	reply.Term = rf.currentTerm
-
-	if len(args.Entries) == 0 { // heartbeat
-		reply.Success = true
-		rf.logger.Printf("AppendEntry, heartbeat, leader: %d, args.term: %d, curTerm: %d", args.LeaderId, term, args.Term)
-		rf.mu.Unlock()
-		return
-	}
 
 	acceptable := func() bool {
 		if args.PrevLogIndex > 0 {
@@ -454,28 +447,36 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			}
 			return true
 		}
-		if args.PrevLogIndex < 0 {
-			return false
-		}
-		// prev log index is 0, no logs exists
+		// prev log index is 0
 		return true
 	}
 
-	if acceptable() {
+	ok := acceptable()
+	if ok {
 		reply.Success = true
-		ind := rf.index2ind(args.PrevLogIndex)
-		rf.log = rf.log[:ind+1]
-		rf.log = append(rf.log, args.Entries...)
-		rf.persist(nil)
+		if len(args.Entries) > 0 {
+			ind := rf.index2ind(args.PrevLogIndex)
+			rf.log = rf.log[:ind+1]
+			rf.log = append(rf.log, args.Entries...)
+			rf.persist(nil)
+		}
 	}
 
 	rf.logger.Printf("AppendEntry, %v, leader: %d, args.term: %d, curTerm: %d, "+
-		"lastIndex: %d, #log: %d, #args.entry: %d, prev: %d-%d, commit index: %d-%d",
+		"lastIndex: %d, #log: %d, #args.entry: %d, prevIndex: %d, prevTerm: %d, commit index: %d-%d",
 		reply.Success, args.LeaderId, args.Term, term,
 		lastIndex, len(rf.log)-1, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm,
 		args.LeaderCommit, rf.commitIndex)
 
-	if !reply.Success || args.LeaderCommit <= rf.commitIndex {
+	if !reply.Success {
+		rf.mu.Unlock()
+		return
+	}
+
+	// reset the follower timer
+	rf.followerC <- struct{}{}
+
+	if args.LeaderCommit <= rf.commitIndex {
 		rf.mu.Unlock()
 		return
 	}
@@ -632,19 +633,63 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) sendRequestVote(server int, cancel <-chan struct{}, args *RequestVoteArgs) (*RequestVoteReply, error) {
+	// fire a request vote request, and set up a timer
+	// if the timer timeout(e.g., network drop the packet
+	// forever), we consider the vote as rejected.
+	// this would avoid the votes gather process
+	// waiting too long and hold the lock too long.
+	timeout := time.Millisecond * roundTripMs * 3
+	sc := make(chan *RequestVoteReply)
+	go func() {
+		reply := &RequestVoteReply{}
+		rf.peers[server].Call("Raft.RequestVote", args, reply)
+		sc <- reply
+	}()
+	select {
+	case reply := <-sc:
+		return reply, nil
+	case <-time.After(timeout):
+		return nil, errors.New("timeout")
+	case <-cancel:
+		return nil, errors.New("canceled")
+	}
 }
 
-func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
-	return ok
+func (rf *Raft) sendAppendEntry(server int, cancel <-chan struct{}, args *AppendEntryArgs) (*AppendEntryReply, error) {
+	timeout := time.Millisecond * roundTripMs * 3
+	sc := make(chan *AppendEntryReply)
+	go func() {
+		reply := &AppendEntryReply{}
+		rf.peers[server].Call("Raft.AppendEntry", args, reply)
+		sc <- reply
+	}()
+	select {
+	case reply := <-sc:
+		return reply, nil
+	case <-time.After(timeout):
+		return nil, errors.New("timeout")
+	case <-cancel:
+		return nil, errors.New("canceled")
+	}
 }
 
-func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
-	return ok
+func (rf *Raft) sendInstallSnapshot(server int, cancel <-chan struct{}, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	timeout := time.Millisecond * roundTripMs * 3
+	sc := make(chan *InstallSnapshotReply)
+	go func() {
+		reply := &InstallSnapshotReply{}
+		rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+		sc <- reply
+	}()
+	select {
+	case reply := <-sc:
+		return reply, nil
+	case <-time.After(timeout):
+		return nil, errors.New("timeout")
+	case <-cancel:
+		return nil, errors.New("canceled")
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -729,7 +774,7 @@ func (rf *Raft) nextHeartbeatTimeout() time.Duration {
 	return timeout
 }
 
-func (rf *Raft) elect() bool {
+func (rf *Raft) elect(cancel <-chan struct{}) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -762,14 +807,17 @@ func (rf *Raft) elect() bool {
 		}
 		go func(server int, args *RequestVoteArgs) {
 			rf.logger.Printf("electing, send RequestVote req to %d, term: %d", server, args.Term)
-			reply := RequestVoteReply{}
-			ok := rf.sendRequestVote(server, args, &reply)
+			r, err := rf.sendRequestVote(server, cancel, args)
+			if err != nil {
+				atomic.StoreInt32(&votes[server], voteRejected)
+				rf.logger.Printf("electing, send RequestVote to %d, term: %d field: %v", server, args.Term, err)
+				return
+			}
 			ans := voteRejected
-			if ok && reply.VoteGranted {
-				ans = reply.Term
+			if r.VoteGranted {
+				ans = r.Term
 			}
 			atomic.StoreInt32(&votes[server], int32(ans))
-			rf.logger.Printf("electing, send RequestVote to %d, term: %d, get %d", server, args.Term, ans)
 		}(ind, &args)
 	}
 	var granted int
@@ -853,7 +901,7 @@ func (rf *Raft) replicate(cancel <-chan struct{}) {
 
 	rf.logger.Printf("replicate, term: %d, upto: index %d, commitIndex: %d", currentTerm, index, commitIndex)
 
-	ok := rf.replicateToAll(seq, currentTerm, index, cancel)
+	ok := rf.replicateToAll(seq, currentTerm, index, commitIndex, cancel)
 	if !ok {
 		return
 	}
@@ -867,10 +915,6 @@ func (rf *Raft) replicate(cancel <-chan struct{}) {
 	rf.mu.Unlock()
 
 	rf.applyEntry(entries, start, commandIndex)
-
-	rf.mu.Lock()
-	rf.persist(nil)
-	rf.mu.Unlock()
 }
 
 // replicateToAll logs that up to index to all peers, return
@@ -879,7 +923,7 @@ func (rf *Raft) replicate(cancel <-chan struct{}) {
 // still continue to retry until the cancel channel is closed.
 // i.e, this replicateAll will guarantee it will always return
 // true, unless the cancel channel is closed.
-func (rf *Raft) replicateToAll(seq int64, currentTerm, index int, cancel <-chan struct{}) bool {
+func (rf *Raft) replicateToAll(seq int64, currentTerm, index, commitIndex int, cancel <-chan struct{}) bool {
 	const true_ = 1
 	var success int64
 	ans := make([]int64, len(rf.peers))
@@ -892,7 +936,7 @@ func (rf *Raft) replicateToAll(seq int64, currentTerm, index int, cancel <-chan 
 		go func(server int) {
 			ch := make(chan bool)
 			go func() {
-				ok := rf.replicateTo(seq, currentTerm, server, index, cancel)
+				ok := rf.replicateTo(seq, currentTerm, server, index, commitIndex, cancel)
 				ch <- ok
 			}()
 			select {
@@ -935,14 +979,10 @@ func (rf *Raft) replicateToAll(seq int64, currentTerm, index int, cancel <-chan 
 	return ok
 }
 
-func (rf *Raft) replicateTo(seq int64, currentTerm, server, index int, cancel <-chan struct{}) bool {
+func (rf *Raft) replicateTo(seq int64, currentTerm, server, index, commitIndex int, cancel <-chan struct{}) bool {
 	startIndex := index
 	endIndex := index + 1
-	timeout := time.Millisecond * roundTripMs
 	for !rf.killed() {
-		sc := make(chan *InstallSnapshotReply)
-		ac := make(chan *AppendEntryReply)
-
 		rf.mu.Lock()
 		if rf.me != rf.leaderId {
 			rf.mu.Unlock()
@@ -954,6 +994,14 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, index int, cancel <-
 			startIndex = nextIndex
 		}
 		prevLogIndex := startIndex - 1
+		if nextIndex == commitIndex+1 {
+			// if nextIndex is equal to commitIndex+1
+			// it means, we've replicated all the entries
+			// up to commitIndex, no entries need to replicate
+			// so, we make a heartbeat here. by heartbeat, it
+			// means the prevLogIndex should be the commitIndex
+			prevLogIndex = commitIndex
+		}
 		prevLogTerm, ok := rf.termOf(prevLogIndex)
 		if !ok { // install snapshot
 			args := &InstallSnapshotArgs{
@@ -964,42 +1012,16 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, index int, cancel <-
 				Data:              rf.snapshot,
 				Done:              true,
 			}
-			reply := &InstallSnapshotReply{}
-			go func() {
-				rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d, start: %d, end: %d, next: %d",
-					seq, server, rf.lastSnapshotIndex, rf.lastSnapshotTerm, startIndex, endIndex, nextIndex)
-				rf.sendInstallSnapshot(server, args, reply)
-				sc <- reply
-			}()
-		} else { // regular append entry or heartbeat
-			commitIndex := rf.commitIndex
-			var entries []Entry
-			if commitIndex < startIndex {
-				start := rf.index2ind(startIndex)
-				end := rf.index2ind(endIndex)
-				entries = rf.log[start:end]
-			}
-			args := &AppendEntryArgs{
-				Term:         currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: commitIndex,
-			}
-			reply := &AppendEntryReply{}
-			go func() {
-				rf.logger.Printf("replicate #%d, send ae req to %d, #entries: %d, index: [%d, %d), pi: %d, pt: %d",
-					seq, server, len(entries), startIndex, endIndex, prevLogIndex, prevLogTerm)
-				rf.sendAppendEntry(server, args, reply)
-				ac <- reply
-			}()
-		}
-		rf.mu.Unlock()
+			rf.mu.Unlock()
 
-		timer := time.NewTimer(timeout)
-		select {
-		case r := <-sc:
+			rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d, start: %d, end: %d, next: %d",
+				seq, server, args.LastIncludedIndex, args.LastIncludedTerm, startIndex, endIndex, nextIndex)
+			r, err := rf.sendInstallSnapshot(server, cancel, args)
+			if err != nil {
+				rf.logger.Printf("replicate #%d, send snapshot req to %d failed: %v", seq, server, err)
+				return false
+			}
+
 			rf.mu.Lock()
 			if r.Term > rf.currentTerm {
 				// stale leader --> follower
@@ -1013,7 +1035,7 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, index int, cancel <-
 				return false
 			}
 			rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d success",
-				seq, server, rf.lastSnapshotIndex, rf.lastSnapshotTerm)
+				seq, server, args.LastIncludedIndex, args.LastIncludedTerm)
 
 			// update the next index and
 			startIndex = rf.lastSnapshotIndex + 1
@@ -1021,43 +1043,60 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, index int, cancel <-
 			// continue the loop for replication if existing
 			// any un-committed entries
 			rf.mu.Unlock()
-		case r := <-ac:
-			rf.mu.Lock()
-			if r.Term > rf.currentTerm {
-				// stale leader --> follower
-				rf.logger.Printf("replicate #%d, stale leader, term: %d -> %d", seq, r.Term, rf.currentTerm)
-				rf.currentTerm = r.Term
-				rf.leaderId = none
-				rf.persist(nil)
+			continue
+		}
+		// regular append entry or heartbeat
+		var entries []Entry
+		if prevLogIndex < startIndex {
+			start := rf.index2ind(startIndex)
+			end := rf.index2ind(endIndex)
+			entries = rf.log[start:end]
+		}
+		args := &AppendEntryArgs{
+			Term:         currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: commitIndex,
+		}
+		rf.mu.Unlock()
 
-				rf.followerC <- struct{}{}
-				rf.mu.Unlock()
-				return false
-			}
-			if r.Success {
-				rf.logger.Printf("replicate #%d, send ae req to %d success, index: [%d, %d), prev index: %d",
-					seq, server, startIndex, endIndex, prevLogIndex)
-
-				rf.nextIndex[server] = endIndex
-				rf.matchIndex[server] = endIndex - 1
-				rf.mu.Unlock()
-				return true
-			}
-
-			if rf.nextIndex[server] > 1 {
-				// make sure the minimum nextIndex is at least 1 after the decrement
-				rf.nextIndex[server]--
-			}
-			rf.mu.Unlock()
-		case <-timer.C:
-			rf.logger.Printf("replicate #%d, send req to %d, index: [%d, %d) timeout",
-				seq, server, startIndex, endIndex)
-			// timeout continue the loop for replication
-		case <-cancel:
-			timer.Stop()
-			rf.logger.Printf("replicate #%d, cancel req to %d", seq, server)
+		rf.logger.Printf("replicate #%d, send ae req to %d, #entries: %d, index: [%d, %d), prevIndex: %d, prevTerm: %d",
+			seq, server, len(entries), startIndex, endIndex, prevLogIndex, prevLogTerm)
+		r, err := rf.sendAppendEntry(server, cancel, args)
+		if err != nil {
+			rf.logger.Printf("replicate #%d, send ae req to %d failed: %v", seq, server, err)
 			return false
 		}
+
+		rf.mu.Lock()
+		if r.Term > rf.currentTerm {
+			// stale leader --> follower
+			rf.logger.Printf("replicate #%d, stale leader, term: %d -> %d", seq, r.Term, rf.currentTerm)
+			rf.currentTerm = r.Term
+			rf.leaderId = none
+			rf.persist(nil)
+
+			rf.followerC <- struct{}{}
+			rf.mu.Unlock()
+			return false
+		}
+		if r.Success {
+			rf.logger.Printf("replicate #%d, send ae req to %d success, index: [%d, %d), prev index: %d",
+				seq, server, startIndex, endIndex, prevLogIndex)
+
+			rf.nextIndex[server] = endIndex
+			rf.matchIndex[server] = endIndex - 1
+			rf.mu.Unlock()
+			return true
+		}
+
+		if rf.nextIndex[server] > 1 {
+			// make sure the minimum nextIndex is at least 1 after the decrement
+			rf.nextIndex[server]--
+		}
+		rf.mu.Unlock()
 	}
 	return false
 }
@@ -1086,12 +1125,17 @@ func (rf *Raft) ticker() {
 					//  2. reset timer to next vote
 					atomic.StoreInt32(&rf.status, Candidate)
 				}
+				// using close as the broadcast to notify
+				// any pending election task to quit.
+				close(cancel)
+				cancel = make(chan struct{})
+
 				// perform an election
 				//  1. if the election succeed, transform to leader
 				//     and set timer to next heartbeat
 				//  2. if the election failed, stay as candidate
 				//     and set votedFor to none & reset timer to next vote
-				ok := rf.elect()
+				ok := rf.elect(cancel)
 				if ok {
 					// candidate --> leader:
 					//  1. reset timer to next heartbeat & replication
@@ -1102,21 +1146,23 @@ func (rf *Raft) ticker() {
 				}
 				tick.Reset(rf.nextVoteTimeout())
 			case Leader:
-				tick.Reset(rf.nextHeartbeatTimeout())
 				// using close as the broadcast to notify
 				// any pending replicate task to quit.
 				close(cancel)
 				cancel = make(chan struct{})
+
+				tick.Reset(rf.nextHeartbeatTimeout())
 
 				// start a replication, if no new logs needs to replicate,
 				// send empty entries as the heartbeat message.
 				go rf.replicate(cancel)
 			}
 		case <-rf.followerC:
-			atomic.StoreInt32(&rf.status, Follower)
-			tick.Reset(rf.nextVoteTimeout())
 			close(cancel)
 			cancel = make(chan struct{})
+
+			atomic.StoreInt32(&rf.status, Follower)
+			tick.Reset(rf.nextVoteTimeout())
 		}
 	}
 }
@@ -1155,8 +1201,8 @@ func (rf *Raft) termOf(index int) (int, bool) {
 		// index is exactly the last snapshot index
 		return rf.lastSnapshotTerm, true
 	}
-	if index <= 0 {
-		// index can be 0, -1 for convenience
+	if index == 0 {
+		// index is zero, means no logs at all.
 		return 0, true
 	}
 	// index is able to locate a valid log entry
