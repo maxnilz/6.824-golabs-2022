@@ -20,7 +20,6 @@ package raft
 import (
 	"6.824/labgob"
 	"bytes"
-	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -123,6 +122,8 @@ type Raft struct {
 	pendingSnapshot      *bytes.Buffer
 	// a counter for append entry message
 	seq int64
+	// a counter for heartbeat message
+	heartbeatSeq int64
 	// logger
 	logger *log.Logger
 	// followerC channel to notify a transition to follower
@@ -335,6 +336,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 
 		rf.leaderId = none
+		rf.followerC <- struct{}{}
 	}
 
 	lastLogIndex, lastLogTerm := rf.last()
@@ -468,13 +470,16 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		lastIndex, len(rf.log)-1, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm,
 		args.LeaderCommit, rf.commitIndex)
 
+	// as long as the AE is valid
+	// no mater if the log is acceptable
+	// or not, reset the follower timer
+	// anyway.
+	rf.followerC <- struct{}{}
+
 	if !reply.Success {
 		rf.mu.Unlock()
 		return
 	}
-
-	// reset the follower timer
-	rf.followerC <- struct{}{}
 
 	if args.LeaderCommit <= rf.commitIndex {
 		rf.mu.Unlock()
@@ -633,63 +638,22 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, cancel <-chan struct{}, args *RequestVoteArgs) (*RequestVoteReply, error) {
-	// fire a request vote request, and set up a timer
-	// if the timer timeout(e.g., network drop the packet
-	// forever), we consider the vote as rejected.
-	// this would avoid the votes gather process
-	// waiting too long and hold the lock too long.
-	timeout := time.Millisecond * roundTripMs * 3
-	sc := make(chan *RequestVoteReply)
-	go func() {
-		reply := &RequestVoteReply{}
-		rf.peers[server].Call("Raft.RequestVote", args, reply)
-		sc <- reply
-	}()
-	select {
-	case reply := <-sc:
-		return reply, nil
-	case <-time.After(timeout):
-		return nil, errors.New("timeout")
-	case <-cancel:
-		return nil, errors.New("canceled")
-	}
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
+	reply := &RequestVoteReply{}
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return reply, ok
 }
 
-func (rf *Raft) sendAppendEntry(server int, cancel <-chan struct{}, args *AppendEntryArgs) (*AppendEntryReply, error) {
-	timeout := time.Millisecond * roundTripMs * 3
-	sc := make(chan *AppendEntryReply)
-	go func() {
-		reply := &AppendEntryReply{}
-		rf.peers[server].Call("Raft.AppendEntry", args, reply)
-		sc <- reply
-	}()
-	select {
-	case reply := <-sc:
-		return reply, nil
-	case <-time.After(timeout):
-		return nil, errors.New("timeout")
-	case <-cancel:
-		return nil, errors.New("canceled")
-	}
+func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs) (*AppendEntryReply, bool) {
+	reply := &AppendEntryReply{}
+	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+	return reply, ok
 }
 
-func (rf *Raft) sendInstallSnapshot(server int, cancel <-chan struct{}, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
-	timeout := time.Millisecond * roundTripMs * 3
-	sc := make(chan *InstallSnapshotReply)
-	go func() {
-		reply := &InstallSnapshotReply{}
-		rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
-		sc <- reply
-	}()
-	select {
-	case reply := <-sc:
-		return reply, nil
-	case <-time.After(timeout):
-		return nil, errors.New("timeout")
-	case <-cancel:
-		return nil, errors.New("canceled")
-	}
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs) (*InstallSnapshotReply, bool) {
+	reply := &InstallSnapshotReply{}
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return reply, ok
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -807,16 +771,12 @@ func (rf *Raft) elect(cancel <-chan struct{}) bool {
 		}
 		go func(server int, args *RequestVoteArgs) {
 			rf.logger.Printf("electing, send RequestVote req to %d, term: %d", server, args.Term)
-			r, err := rf.sendRequestVote(server, cancel, args)
-			if err != nil {
-				atomic.StoreInt32(&votes[server], voteRejected)
-				rf.logger.Printf("electing, send RequestVote to %d, term: %d field: %v", server, args.Term, err)
-				return
-			}
+			r, ok := rf.sendRequestVote(server, args)
 			ans := voteRejected
-			if r.VoteGranted {
+			if ok && r.VoteGranted {
 				ans = r.Term
 			}
+			rf.logger.Printf("electing, RequestVote req to %d, term: %d, granted: %v", server, args.Term, r.VoteGranted)
 			atomic.StoreInt32(&votes[server], int32(ans))
 		}(ind, &args)
 	}
@@ -851,8 +811,15 @@ func (rf *Raft) elect(cancel <-chan struct{}) bool {
 		if finished == len(votes) {
 			break
 		}
-		time.Sleep(time.Millisecond * 3)
+		select {
+		case <-cancel:
+			rf.logger.Printf("electing, term: %d, canceled", rf.currentTerm)
+			goto end
+		default:
+			time.Sleep(time.Millisecond * 3)
+		}
 	}
+end:
 	term := rf.currentTerm
 	if maxTerm > rf.currentTerm {
 		rf.currentTerm = maxTerm
@@ -886,44 +853,96 @@ func (rf *Raft) elect(cancel <-chan struct{}) bool {
 	return true
 }
 
-func (rf *Raft) replicate(cancel <-chan struct{}) {
+func (rf *Raft) heartbeat() {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.me != rf.leaderId {
-		rf.mu.Unlock()
 		return
 	}
-	index, _ := rf.last()
-	currentTerm := rf.currentTerm
-	commitIndex := rf.commitIndex
-	rf.seq++
-	seq := rf.seq
-	rf.mu.Unlock()
-
-	rf.logger.Printf("replicate, term: %d, upto: index %d, commitIndex: %d", currentTerm, index, commitIndex)
-
-	ok := rf.replicateToAll(seq, currentTerm, index, commitIndex, cancel)
-	if !ok {
-		return
+	lastIndex, lastTerm := rf.last()
+	args := AppendEntryArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: lastIndex,
+		PrevLogTerm:  lastTerm,
+		LeaderCommit: rf.commitIndex,
 	}
-
-	rf.mu.Lock()
-	commandIndex := rf.lastApplied + 1
-	start := rf.index2ind(commandIndex)
-	end := rf.index2ind(index) + 1
-	entries := rf.log[start:end]
-	rf.commitIndex = index
-	rf.mu.Unlock()
-
-	rf.applyEntry(entries, start, commandIndex)
+	rf.heartbeatSeq++
+	seq := rf.heartbeatSeq
+	for i := range rf.peers {
+		if i == rf.me {
+			continue // do not heartbeat to myself
+		}
+		go func(server int, a AppendEntryArgs) {
+			rf.logger.Printf("heartbeat #%d to %d", seq, server)
+			r, ok := rf.sendAppendEntry(server, &a)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if r.Term > rf.currentTerm {
+				rf.logger.Printf("heartbeat #%d, stale leader, term: %d -> %d", seq, r.Term, rf.currentTerm)
+				rf.followerC <- struct{}{}
+			}
+			rf.logger.Printf("heartbeat #%d to %d %v, seq: %d, %d", seq, server, ok, seq, rf.heartbeatSeq)
+		}(i, args)
+	}
 }
 
-// replicateToAll logs that up to index to all peers, return
+func (rf *Raft) replicate(done <-chan struct{}) {
+	cancel := make(chan struct{})
+	for !rf.killed() {
+		select {
+		case <-time.After(time.Millisecond):
+			rf.mu.Lock()
+			if rf.me != rf.leaderId {
+				rf.mu.Unlock()
+				return
+			}
+			index, _ := rf.last()
+			currentTerm := rf.currentTerm
+			commitIndex := rf.commitIndex
+			rf.seq++
+			seq := rf.seq
+			rf.mu.Unlock()
+
+			if index == commitIndex {
+				continue // no new log entries need to replicate
+			}
+
+			// before start a new replication
+			// cancel all existing pending replication.
+			close(cancel)
+			cancel = make(chan struct{})
+
+			rf.logger.Printf("replicate #%d, term: %d, upto: index %d, commitIndex: %d", seq, currentTerm, index, commitIndex)
+
+			ok := rf.replicateWithWait(seq, currentTerm, index, commitIndex, cancel)
+			if !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			commandIndex := rf.lastApplied + 1
+			start := rf.index2ind(commandIndex)
+			end := rf.index2ind(index) + 1
+			entries := rf.log[start:end]
+			rf.commitIndex = index
+			rf.mu.Unlock()
+
+			rf.applyEntry(entries, start, commandIndex)
+		case <-done:
+			close(cancel)
+			return
+		}
+	}
+}
+
+// replicateWithWait logs that up to index to all peers, return
 // true immediately if majority replicated, and if there is
 // any un-responded or failed replicate request, they will
 // still continue to retry until the cancel channel is closed.
-// i.e, this replicateAll will guarantee it will always return
-// true, unless the cancel channel is closed.
-func (rf *Raft) replicateToAll(seq int64, currentTerm, index, commitIndex int, cancel <-chan struct{}) bool {
+// i.e, it returns true if log replicated to majority peers,
+// and false if the cancel channel is closed.
+func (rf *Raft) replicateWithWait(seq int64, currentTerm, index, commitIndex int, cancel <-chan struct{}) bool {
 	const true_ = 1
 	var success int64
 	ans := make([]int64, len(rf.peers))
@@ -982,6 +1001,7 @@ func (rf *Raft) replicateToAll(seq int64, currentTerm, index, commitIndex int, c
 func (rf *Raft) replicateTo(seq int64, currentTerm, server, index, commitIndex int, cancel <-chan struct{}) bool {
 	startIndex := index
 	endIndex := index + 1
+	numSnapshotRetry, numAERetry := 0, 0
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.me != rf.leaderId {
@@ -1014,15 +1034,24 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, index, commitIndex i
 			}
 			rf.mu.Unlock()
 
-			rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d, start: %d, end: %d, next: %d",
-				seq, server, args.LastIncludedIndex, args.LastIncludedTerm, startIndex, endIndex, nextIndex)
-			r, err := rf.sendInstallSnapshot(server, cancel, args)
-			if err != nil {
-				rf.logger.Printf("replicate #%d, send snapshot req to %d failed: %v", seq, server, err)
-				return false
+			rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d, start: %d, end: %d, next: %d, cnt: %d",
+				seq, server, args.LastIncludedIndex, args.LastIncludedTerm, startIndex, endIndex, nextIndex, numSnapshotRetry)
+			r, ok := rf.sendInstallSnapshot(server, args)
+			if !ok {
+				numSnapshotRetry++
+				continue // continue to retry
 			}
 
 			rf.mu.Lock()
+			if seq < rf.seq {
+				// out-of-order response, it means there must a new
+				// replication process is currently running. Abort
+				// here immediately so that this out-of-order response
+				// will update any non-local state unexpectedly.
+				rf.logger.Printf("relicate #%d, out-of-order snapshot response, current seq: %d", seq, rf.seq)
+				rf.mu.Unlock()
+				return false
+			}
 			if r.Term > rf.currentTerm {
 				// stale leader --> follower
 				rf.logger.Printf("replicate #%d, stale leader, term: %d -> %d", seq, r.Term, rf.currentTerm)
@@ -1062,15 +1091,24 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, index, commitIndex i
 		}
 		rf.mu.Unlock()
 
-		rf.logger.Printf("replicate #%d, send ae req to %d, #entries: %d, index: [%d, %d), prevIndex: %d, prevTerm: %d",
-			seq, server, len(entries), startIndex, endIndex, prevLogIndex, prevLogTerm)
-		r, err := rf.sendAppendEntry(server, cancel, args)
-		if err != nil {
-			rf.logger.Printf("replicate #%d, send ae req to %d failed: %v", seq, server, err)
-			return false
+		rf.logger.Printf("replicate #%d, send ae req to %d, #entries: %d, index: [%d, %d), prevIndex: %d, prevTerm: %d, cnt: %d",
+			seq, server, len(entries), startIndex, endIndex, prevLogIndex, prevLogTerm, numAERetry)
+		r, ok := rf.sendAppendEntry(server, args)
+		if !ok {
+			numAERetry++
+			continue // continue to retry
 		}
 
 		rf.mu.Lock()
+		if seq < rf.seq {
+			// out-of-order response, it means there must a new
+			// replication process is currently running. Abort
+			// here immediately so that this out-of-order response
+			// will update any non-local state unexpectedly.
+			rf.logger.Printf("relicate #%d, out-of-order ae response, current seq: %d", seq, rf.seq)
+			rf.mu.Unlock()
+			return false
+		}
 		if r.Term > rf.currentTerm {
 			// stale leader --> follower
 			rf.logger.Printf("replicate #%d, stale leader, term: %d -> %d", seq, r.Term, rf.currentTerm)
@@ -1097,6 +1135,13 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, index, commitIndex i
 			rf.nextIndex[server]--
 		}
 		rf.mu.Unlock()
+
+		select {
+		case <-cancel:
+			return false
+		default:
+			// noop but make it nonblocking
+		}
 	}
 	return false
 }
@@ -1136,28 +1181,34 @@ func (rf *Raft) ticker() {
 				//  2. if the election failed, stay as candidate
 				//     and set votedFor to none & reset timer to next vote
 				ok := rf.elect(cancel)
-				if ok {
-					// candidate --> leader:
-					//  1. reset timer to next heartbeat & replication
-					//  2. heartbeat & replication share a same timer
-					atomic.StoreInt32(&rf.status, Leader)
-					tick.Reset(time.Millisecond)
+				if !ok {
+					tick.Reset(rf.nextVoteTimeout())
 					continue
 				}
-				tick.Reset(rf.nextVoteTimeout())
-			case Leader:
-				// using close as the broadcast to notify
-				// any pending replicate task to quit.
-				close(cancel)
-				cancel = make(chan struct{})
-
-				tick.Reset(rf.nextHeartbeatTimeout())
-
-				// start a replication, if no new logs needs to replicate,
-				// send empty entries as the heartbeat message.
+				// candidate --> leader:
+				atomic.StoreInt32(&rf.status, Leader)
+				// use two separate path for replication
+				// and heartbeat.
+				// the reason that does not reuse the
+				// heartbeat to do replication is, the
+				// replication process is implemented
+				// to wait the majority success, however
+				// the heartbeat does not need to wait,
+				// this implies replication and heartbeat
+				// may happen in different pace.
+				// for simplicity just separate these two.
+				//
+				//  1. start a replication task
 				go rf.replicate(cancel)
+				//  2. reset timer to next heartbeat
+				tick.Reset(time.Millisecond)
+			case Leader:
+				go rf.heartbeat()
+				tick.Reset(rf.nextHeartbeatTimeout())
 			}
 		case <-rf.followerC:
+			// using close as the broadcast to notify
+			// any pending election or leader task to quit.
 			close(cancel)
 			cancel = make(chan struct{})
 
