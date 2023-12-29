@@ -61,9 +61,9 @@ type Entry struct {
 }
 
 const (
-	Follower = iota
-	Candidate
-	Leader
+	follower = iota
+	candidate
+	leader
 )
 
 // A Go object implementing a single Raft peer.
@@ -339,13 +339,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		return
 	}
+	switch2follower := false
 	term := rf.currentTerm
 	if args.Term > term {
 		rf.votedFor = none
 		rf.currentTerm = args.Term
-
-		rf.leaderId = none
-		rf.followerC <- struct{}{}
+		switch2follower = true
 	}
 
 	lastLogIndex, lastLogTerm := rf.last()
@@ -369,14 +368,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		//  1. stale candidate --> follower
 		//  2. stale leader --> follower
 		rf.votedFor = args.CandidateId
-
-		rf.leaderId = none
-		rf.followerC <- struct{}{}
+		switch2follower = true
 	}
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = voteGranted
 
-	rf.persist(nil)
+	if switch2follower {
+		rf.persist(nil)
+		rf.leaderId = none
+		rf.followerC <- struct{}{}
+	}
 
 	rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d -> %d, votedFor: %d, allow: %v, uptodate: %v, granted: %v",
 		args.CandidateId, args.Term, term, rf.currentTerm, rf.votedFor, isAllowedCandidate, isUpToDate(), voteGranted)
@@ -398,6 +399,10 @@ type AppendEntryArgs struct {
 
 	// leader's commit index
 	LeaderCommit int
+
+	// for debug purpose
+	HeartbeatSeq   int64
+	AppendEntrySeq int64
 }
 
 type AppendEntryReply struct {
@@ -481,10 +486,10 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	latestIndex, _ := rf.last()
 	rf.logger.Printf("AppendEntry, %v, leader: %d, args.term: %d, curTerm: %d, "+
-		"lastIndex, before: %d, after: %d, #log: %d, #args.entry: %d, prevIndex: %d, prevTerm: %d, commit index: %d-%d",
+		"lastIndex, before: %d, after: %d, #log: %d, #args.entry: %d, prevIndex: %d, prevTerm: %d, commit index: %d-%d, hseq: %d, aseq: %d",
 		reply.Success, args.LeaderId, args.Term, term,
 		lastIndex, latestIndex, len(rf.log)-1, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm,
-		args.LeaderCommit, rf.commitIndex)
+		args.LeaderCommit, rf.commitIndex, args.HeartbeatSeq, args.AppendEntrySeq)
 
 	if !reply.Success {
 		return
@@ -758,6 +763,9 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 	var granted int
 	var finished int
 	ans := make([]int, n)
+	for i := 0; i < n; i++ {
+		ans[i] = voteInvalid
+	}
 	ch := make(chan struct{}, n)
 
 	rf.logger.Printf("electing, gathering votes for term: %d", rf.currentTerm)
@@ -864,15 +872,16 @@ func (rf *Raft) heartbeat() {
 		return
 	}
 	lastIndex, lastTerm := rf.last()
+	rf.heartbeatSeq++
+	seq := rf.heartbeatSeq
 	args := AppendEntryArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: lastIndex,
 		PrevLogTerm:  lastTerm,
 		LeaderCommit: rf.commitIndex,
+		HeartbeatSeq: seq,
 	}
-	rf.heartbeatSeq++
-	seq := rf.heartbeatSeq
 	for i := range rf.peers {
 		if i == rf.me {
 			continue // do not heartbeat to myself
@@ -884,6 +893,10 @@ func (rf *Raft) heartbeat() {
 			defer rf.mu.Unlock()
 			if r.Term > rf.currentTerm {
 				rf.logger.Printf("heartbeat #%d, stale leader, aTerm: %d, rTerm: %d, curTerm: %d", seq, a.Term, r.Term, rf.currentTerm)
+				rf.currentTerm = r.Term
+				rf.leaderId = none
+				rf.persist(nil)
+
 				rf.followerC <- struct{}{}
 			}
 			rf.logger.Printf("heartbeat #%d to %d %v, seq: %d, %d, term: %d", seq, server, ok, seq, rf.heartbeatSeq, a.Term)
@@ -894,12 +907,17 @@ func (rf *Raft) heartbeat() {
 func (rf *Raft) replicate(done <-chan struct{}) {
 	interval := time.Millisecond * 5
 	tick := time.NewTicker(interval)
+	cancel := make(chan struct{})
 	go func() {
 		for it := range tick.C {
 			if it.IsZero() {
-				break // tick is closed
+				break // tick.C is closed
 			}
 			rf.mu.Lock()
+			if rf.me != rf.leaderId {
+				rf.mu.Unlock()
+				return // not leader anymore
+			}
 			currentTerm := rf.currentTerm
 			index, _ := rf.last()
 			commitIndex := rf.commitIndex
@@ -909,28 +927,44 @@ func (rf *Raft) replicate(done <-chan struct{}) {
 			}
 			rf.seq++
 			seq := rf.seq
+			// abort any pending replicate process between
+			// last replication & the replication we are
+			// about to start, because we leave un-succeed
+			// replication(may network lag) continue to run even
+			// if we get majority success & committed the log.
+			// reuse rf.mu to avoid data race.
+			close(cancel)
+			cancel = make(chan struct{})
 			rf.mu.Unlock()
 
-			rf.replicateToAll(currentTerm, index, commitIndex, seq)
+			rf.replicateToAll(currentTerm, index, commitIndex, seq, cancel)
 		}
 	}()
 
 	<-done
 	rf.mu.Lock()
+	close(cancel)
+	cancel = make(chan struct{})
 	rf.logger.Printf("replicatiton canceled, term: %d, curLeader: %d", rf.currentTerm, rf.leaderId)
 	rf.mu.Unlock()
 	tick.Stop()
 }
 
-func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64) {
+const (
+	true_ = iota + 1
+	abort
+	retry
+)
+
+func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64, cancel <-chan struct{}) {
 	rf.logger.Printf("replicate #%d, term: %d, upto: %d, commitIndex: %d", seq, currentTerm, index, commitIndex)
-	const true_ = 1
 	var success int64
 	n := len(rf.peers)
 	majority := int64(n/2 + 1)
 	ans := make([]int64, n)
 	ch := make(chan struct{}, n)
-	var timeout int64
+	abortCh := make(chan struct{}, n)
+	var aborted int64
 	for peer := range rf.peers {
 		if peer == rf.me {
 			ans[peer] = true_
@@ -938,17 +972,29 @@ func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64) {
 			continue
 		}
 		go func(server int) {
-			for atomic.LoadInt64(&timeout) != true_ {
-				ok := rf.replicateTo(seq, currentTerm, server, index, commitIndex)
-				if !ok {
+			for atomic.LoadInt64(&aborted) != true_ {
+				select {
+				case <-cancel:
+					rf.logger.Printf("replicate #%d, to: %d, term: %d, upto: %d canceled", seq, server, currentTerm, index)
+					return // terminate the replication process loop
+				default:
+					// only for check cancel, make it nonblock
+				}
+				rtcd := rf.replicateTo(seq, currentTerm, server, index, commitIndex)
+				switch rtcd {
+				case retry:
 					continue // retry the replication until succeed
+				case abort:
+					abortCh <- struct{}{}
+					return // terminate the replicate process loop
+				case true_:
+					atomic.AddInt64(&success, 1)
+					atomic.StoreInt64(&ans[server], true_)
+					if atomic.LoadInt64(&success) >= majority {
+						ch <- struct{}{}
+					}
+					return // the replication to given server succeed
 				}
-				atomic.AddInt64(&success, 1)
-				atomic.StoreInt64(&ans[server], true_)
-				if atomic.LoadInt64(&success) >= majority {
-					ch <- struct{}{}
-				}
-				break // the replication to given server succeed
 			}
 		}(peer)
 	}
@@ -959,7 +1005,7 @@ func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64) {
 		for peer := range rf.peers {
 			res[peer] = atomic.LoadInt64(&ans[peer])
 		}
-		rf.logger.Printf("replicate #%d, term: %d upto: %d, succeed, ans: %v", seq, currentTerm, index, res)
+		rf.logger.Printf("replicate #%d, term: %d, upto: %d, succeed, ans: %v", seq, currentTerm, index, res)
 
 		rf.mu.Lock()
 		commandIndex := rf.lastApplied + 1
@@ -972,21 +1018,32 @@ func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64) {
 		rf.mu.Unlock()
 
 	case <-time.After(time.Millisecond * roundTripMs * 3):
-		rf.logger.Printf("replicate #%d, term: %d upto: %d, timeout", seq, currentTerm, index)
-		// set timeout to true to cancel any pending replication process.
+		rf.logger.Printf("replicate #%d, term: %d, upto: %d, timeout", seq, currentTerm, index)
+		// set aborted to true to cancel any pending replication process.
 		// although, there could be replication request on the fly,
 		// the replicateTo process is implemented out-of-order tolerate
 		// way(maybe an out-of-order response could cause some lag, but
 		// it won't harm the correctness)
-		atomic.StoreInt64(&timeout, true_)
+		atomic.StoreInt64(&aborted, true_)
+
+	case <-abortCh:
+		rf.logger.Printf("replicate #%d, term: %d, upto: %d, aborted", seq, currentTerm, index)
+		atomic.StoreInt64(&aborted, true_)
 	}
 }
 
-func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex int) bool {
+func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex int) int {
 	rf.mu.Lock()
+	if rf.me != rf.leaderId {
+		rf.mu.Unlock()
+		return abort // not leader anymore
+	}
 	start := rf.nextIndex[server]
 	end := upto + 1
-
+	if start == 0 {
+		rf.mu.Unlock()
+		return abort // start should be at least 1
+	}
 	if start <= rf.lastSnapshotIndex {
 		// snapshot
 		args := &InstallSnapshotArgs{
@@ -1003,7 +1060,7 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 			seq, server, args.LastIncludedIndex, args.LastIncludedTerm, start, end)
 		r, ok := rf.sendInstallSnapshot(server, args)
 		if !ok {
-			return false
+			return retry
 		}
 
 		rf.mu.Lock()
@@ -1016,7 +1073,7 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 
 			rf.followerC <- struct{}{}
 			rf.mu.Unlock()
-			return true
+			return abort
 		}
 		rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d success",
 			seq, server, args.LastIncludedIndex, args.LastIncludedTerm)
@@ -1027,30 +1084,33 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 
 		// return false to indicate the caller continue to
 		// replicate any un-committed entries
-		return false
+		return retry
 	}
 
 	prevIndex := start - 1
 	prevTerm, _ := rf.termOf(prevIndex)
-	var entries []Entry
 	a := rf.index2ind(start)
 	b := rf.index2ind(end)
+
+	rf.logger.Printf("replicate #%d, send ae req to %d, #entries: %d, index: [%d, %d), ind: [%d, %d), prevIndex: %d, prevTerm: %d",
+		seq, server, end-start, start, end, a, b, prevIndex, prevTerm)
+
+	var entries []Entry
 	entries = rf.log[a:b]
 	args := &AppendEntryArgs{
-		Term:         currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: prevIndex,
-		PrevLogTerm:  prevTerm,
-		Entries:      entries,
-		LeaderCommit: commitIndex,
+		Term:           currentTerm,
+		LeaderId:       rf.me,
+		PrevLogIndex:   prevIndex,
+		PrevLogTerm:    prevTerm,
+		Entries:        entries,
+		LeaderCommit:   commitIndex,
+		AppendEntrySeq: seq,
 	}
 	rf.mu.Unlock()
 
-	rf.logger.Printf("replicate #%d, send ae req to %d, #entries: %d, index: [%d, %d), prevIndex: %d, prevTerm: %d",
-		seq, server, len(entries), start, end, prevIndex, prevTerm)
 	r, ok := rf.sendAppendEntry(server, args)
 	if !ok {
-		return false
+		return retry
 	}
 
 	rf.mu.Lock()
@@ -1063,7 +1123,7 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 
 		rf.followerC <- struct{}{}
 		rf.mu.Unlock()
-		return true
+		return abort
 	}
 
 	// we might get an out-of-order response caused by the test network setup,
@@ -1079,13 +1139,13 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 		rf.nextIndex[server] = end
 		rf.matchIndex[server] = upto
 		rf.mu.Unlock()
-		return true
+		return true_
 	}
 
-	rf.nextIndex[server] = start - 1
+	rf.nextIndex[server] = prevIndex
 	rf.mu.Unlock()
 
-	return false
+	return retry
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -1101,8 +1161,8 @@ func (rf *Raft) ticker() {
 		case <-tick.C:
 			status := atomic.LoadInt32(&rf.status)
 			switch status {
-			case Follower, Candidate:
-				if status == Follower {
+			case follower, candidate:
+				if status == follower {
 					// leader --> follower:
 					//  1. set leader id to new leader id(perform at transition site)
 					//  2. set the term to leader's term(perform at transition site)
@@ -1110,7 +1170,7 @@ func (rf *Raft) ticker() {
 					// candidate --> follower:
 					//  1. set votedFor to none(perform at transition side)
 					//  2. reset timer to next vote
-					atomic.StoreInt32(&rf.status, Candidate)
+					atomic.StoreInt32(&rf.status, candidate)
 				}
 				// using close as the broadcast to notify
 				// any pending election task to quit.
@@ -1130,7 +1190,7 @@ func (rf *Raft) ticker() {
 						return // election does not succeed
 					}
 					// candidate --> leader:
-					atomic.StoreInt32(&rf.status, Leader)
+					atomic.StoreInt32(&rf.status, leader)
 
 					// use two separate path for replication
 					// and heartbeat.
@@ -1150,19 +1210,20 @@ func (rf *Raft) ticker() {
 					//  3. reset timer to next heartbeat
 					tick.Reset(rf.nextHeartbeatTimeout())
 				}(cancel)
-			case Leader:
+			case leader:
 				go rf.heartbeat()
 				tick.Reset(rf.nextHeartbeatTimeout())
 			}
 		case <-rf.followerC:
-			rf.logger.Printf("reset to follower")
-
 			// using close as the broadcast to notify
 			// any pending election or leader task to quit.
 			close(cancel)
 			cancel = make(chan struct{})
 
-			atomic.StoreInt32(&rf.status, Follower)
+			status := atomic.LoadInt32(&rf.status)
+			rf.logger.Printf("switch to %v from %v", status, follower)
+
+			atomic.StoreInt32(&rf.status, follower)
 			tick.Reset(rf.nextVoteTimeout())
 		}
 	}
