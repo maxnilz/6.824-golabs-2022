@@ -139,8 +139,6 @@ type Raft struct {
 	// for each server, index of highest log entry known to be replicated
 	// on server, initialized to 0, increases monotonically
 	matchIndex []int
-	// channel to notify the replication process when new command arrived
-	commandCh chan int
 }
 
 // return currentTerm and whether this server
@@ -696,8 +694,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index, _ = rf.last()
 	rf.persist(nil)
 
-	rf.commandCh <- index
-
 	rf.logger.Printf("Start, command %v at index: %d, term: %d", command, index, term)
 
 	return index, term, isLeader
@@ -754,19 +750,26 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 	rf.votedFor = rf.me // vote itself first
 	rf.leaderId = none
 	rf.persist(nil)
-
-	votes := make([]int32, len(rf.peers))
-	for i := range votes {
-		votes[i] = voteInvalid
-	}
 	lastLogIndex, lastLogTerm := rf.last()
+
+	n := len(rf.peers)
+	majority := n/2 + 1
+	var mu sync.Mutex
+	var granted int
+	var finished int
+	ans := make([]int, n)
+	ch := make(chan struct{}, n)
 
 	rf.logger.Printf("electing, gathering votes for term: %d", rf.currentTerm)
 
 	for ind := range rf.peers {
-		if ind == rf.me { // voted itself
-			votes[ind] = int32(rf.currentTerm)
-			continue
+		if ind == rf.me {
+			mu.Lock()
+			granted++
+			finished++
+			ans[ind] = rf.currentTerm
+			mu.Unlock()
+			continue // voted itself
 		}
 		args := RequestVoteArgs{
 			Term:         rf.currentTerm,
@@ -775,58 +778,51 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 			LastLogTerm:  lastLogTerm,
 		}
 		go func(server int, args *RequestVoteArgs) {
+			rTerm := voteRejected
 			rf.logger.Printf("electing, send RequestVote req to %d, term: %d", server, args.Term)
 			r, ok := rf.sendRequestVote(server, args)
-			ans := voteRejected
+
+			mu.Lock()
+			defer mu.Unlock()
+
 			if ok && r.VoteGranted {
-				ans = r.Term
-			}
-			rf.logger.Printf("electing, RequestVote req to %d, term: %d, granted: %v", server, args.Term, r.VoteGranted)
-			atomic.StoreInt32(&votes[server], int32(ans))
-		}(ind, &args)
-	}
-	var granted int
-	var finished int
-	var maxTerm int
-	elected := false
-	majority := len(votes)/2 + 1
-	res := make([]int, len(rf.peers))
-	for !rf.killed() {
-		granted = 0
-		finished = 0
-		maxTerm = rf.currentTerm
-		for i := 0; i < len(votes); i++ {
-			peerTerm := int(atomic.LoadInt32(&votes[i]))
-			if peerTerm > rf.currentTerm {
-				maxTerm = peerTerm
-			}
-			if peerTerm >= 0 {
-				res[i] = peerTerm
+				rTerm = r.Term
 				granted++
 			}
-			if peerTerm >= 0 || peerTerm == voteRejected {
-				finished++
+			finished++
+			ans[server] = rTerm
+			if granted >= majority || finished == n {
+				ch <- struct{}{}
 			}
-		}
-		if maxTerm > rf.currentTerm {
-			break
-		}
+			rf.logger.Printf("electing, RequestVote req to %d, term: %d, granted: %v", server, args.Term, r.VoteGranted)
+		}(ind, &args)
+	}
+
+	// wait first events on ch or done only once with select.
+	var maxTerm int
+	var elected bool
+	var numGranted int
+	res := make([]int, len(rf.peers))
+	select {
+	case <-ch:
+		mu.Lock()
 		if granted >= majority {
 			elected = true
-			break
 		}
-		if finished == len(votes) {
-			break
+		for i, a := range ans {
+			res[i] = a
+			if maxTerm < a {
+				maxTerm = a
+			}
 		}
-		select {
-		case <-done:
-			rf.logger.Printf("electing, term: %d, canceled", rf.currentTerm)
-			goto end
-		default:
-			time.Sleep(time.Millisecond * 3)
-		}
+		// make a copy for log to avoid data race
+		numGranted = granted
+		mu.Unlock()
+	case <-done:
+		rf.logger.Printf("electing, term: %d, canceled", rf.currentTerm)
 	}
-end:
+
+	// handle election results
 	term := rf.currentTerm
 	if maxTerm > rf.currentTerm {
 		rf.currentTerm = maxTerm
@@ -838,7 +834,7 @@ end:
 	if !elected {
 		rf.votedFor = none
 		rf.persist(nil)
-		rf.logger.Printf("electing, election failed, term: %d, granted: %d, require: %d", rf.currentTerm, granted, majority)
+		rf.logger.Printf("electing, election failed, term: %d, granted: %d, require: %d", rf.currentTerm, numGranted, majority)
 		return false
 	}
 
@@ -896,67 +892,45 @@ func (rf *Raft) heartbeat() {
 }
 
 func (rf *Raft) replicate(done <-chan struct{}) {
-	batchSize, batchLimit := 0, 10
-	timeout := time.Millisecond * 100
-	tick := time.NewTicker(timeout)
-	cancel := make(chan struct{})
-	for !rf.killed() {
-		select {
-		case <-tick.C:
-			if batchSize == 0 {
-				continue
+	interval := time.Millisecond * 5
+	tick := time.NewTicker(interval)
+	go func() {
+		for it := range tick.C {
+			if it.IsZero() {
+				break // tick is closed
 			}
-			tick.Reset(timeout)
-			// before start a new replication
-			// cancel all existing pending replication.
-			close(cancel)
-			cancel = make(chan struct{})
-			go func(ch chan struct{}) {
-				rf.replicateWithWait(ch)
-			}(cancel)
-		case <-rf.commandCh:
-			batchSize++
-			if batchSize < batchLimit {
-				continue
-			}
-			batchSize = 0
-			tick.Reset(timeout)
-			// before start a new replication
-			// cancel all existing pending replication.
-			close(cancel)
-			cancel = make(chan struct{})
-			go func(ch chan struct{}) {
-				rf.replicateWithWait(ch)
-			}(cancel)
-		case <-done:
 			rf.mu.Lock()
-			rf.logger.Printf("replicatiton canceled, term: %d, curLeader: %d", rf.currentTerm, rf.leaderId)
+			currentTerm := rf.currentTerm
+			index, _ := rf.last()
+			commitIndex := rf.commitIndex
+			if index == commitIndex {
+				rf.mu.Unlock()
+				continue // no entries need to replicate
+			}
+			rf.seq++
+			seq := rf.seq
 			rf.mu.Unlock()
-			close(cancel)
-			return
+
+			rf.replicateToAll(currentTerm, index, commitIndex, seq)
 		}
-	}
+	}()
+
+	<-done
+	rf.mu.Lock()
+	rf.logger.Printf("replicatiton canceled, term: %d, curLeader: %d", rf.currentTerm, rf.leaderId)
+	rf.mu.Unlock()
+	tick.Stop()
 }
 
-// replicateWithWait logs that up to lastIndex to all peers,
-// return immediately if majority replicated, and if there is
-// any un-responded or failed replicate request, they will
-// still continue to retry even if the func call already returned
-// until the cancel channel is closed.
-func (rf *Raft) replicateWithWait(cancel <-chan struct{}) {
-	rf.mu.Lock()
-	index, _ := rf.last()
-	currentTerm := rf.currentTerm
-	commitIndex := rf.commitIndex
-	rf.seq++
-	seq := rf.seq
-	rf.mu.Unlock()
-
+func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64) {
 	rf.logger.Printf("replicate #%d, term: %d, upto: %d, commitIndex: %d", seq, currentTerm, index, commitIndex)
-
 	const true_ = 1
 	var success int64
-	ans := make([]int64, len(rf.peers))
+	n := len(rf.peers)
+	majority := int64(n/2 + 1)
+	ans := make([]int64, n)
+	ch := make(chan struct{}, n)
+	var timeout int64
 	for peer := range rf.peers {
 		if peer == rf.me {
 			ans[peer] = true_
@@ -964,183 +938,153 @@ func (rf *Raft) replicateWithWait(cancel <-chan struct{}) {
 			continue
 		}
 		go func(server int) {
-			ok := rf.replicateTo(seq, currentTerm, server, index, commitIndex, cancel)
-			if ok {
+			for atomic.LoadInt64(&timeout) != true_ {
+				ok := rf.replicateTo(seq, currentTerm, server, index, commitIndex)
+				if !ok {
+					continue // retry the replication until succeed
+				}
 				atomic.AddInt64(&success, 1)
 				atomic.StoreInt64(&ans[server], true_)
+				if atomic.LoadInt64(&success) >= majority {
+					ch <- struct{}{}
+				}
+				break // the replication to given server succeed
 			}
 		}(peer)
 	}
 
-	ch := make(chan bool)
-	majority := len(rf.peers)/2 + 1
-	res := make([]int64, len(rf.peers))
-
-	go func() {
-		for !rf.killed() {
-			select {
-			case <-time.After(time.Millisecond):
-				if atomic.LoadInt64(&success) >= int64(majority) {
-					for peer := range rf.peers {
-						res[peer] = atomic.LoadInt64(&ans[peer])
-					}
-					ch <- true
-					return
-				}
-			case <-cancel:
-				ch <- false
-				return
-			}
+	select {
+	case <-ch:
+		res := make([]int64, len(rf.peers))
+		for peer := range rf.peers {
+			res[peer] = atomic.LoadInt64(&ans[peer])
 		}
-	}()
-
-	ok := <-ch
-	n := atomic.LoadInt64(&success)
-	rf.logger.Printf("replicate #%d, term: %d upto: %d, success: %d, ans: %v, ok: %v", seq, currentTerm, index, n, res, ok)
-	if !ok {
-		return
-	}
-
-	// replicated to majority, commit & apply entries
-	rf.mu.Lock()
-	commandIndex := rf.lastApplied + 1
-	start := rf.index2ind(commandIndex)
-	end := rf.index2ind(index) + 1
-	entries := rf.log[start:end]
-	rf.commitIndex = index
-	rf.applyEntry(entries, start, commandIndex)
-	rf.persist(nil)
-	rf.mu.Unlock()
-}
-
-func (rf *Raft) replicateTo(seq int64, currentTerm, server, index, commitIndex int, cancel <-chan struct{}) bool {
-	startIndex := index
-	endIndex := index + 1
-	numSnapshotRetry, numAERetry := 0, 0
-	for !rf.killed() {
-		select {
-		case <-cancel:
-			rf.logger.Printf("replicate #%d, to %d canceled, term: %d", seq, server, currentTerm)
-			return false
-		default:
-			// noop but make it nonblocking
-		}
+		rf.logger.Printf("replicate #%d, term: %d upto: %d, succeed, ans: %v", seq, currentTerm, index, res)
 
 		rf.mu.Lock()
-		if rf.me != rf.leaderId {
-			rf.mu.Unlock()
-			return false
-		}
+		commandIndex := rf.lastApplied + 1
+		start := rf.index2ind(commandIndex)
+		end := rf.index2ind(index) + 1
+		entries := rf.log[start:end]
+		rf.commitIndex = index
+		rf.applyEntry(entries, start, commandIndex)
+		rf.persist(nil)
+		rf.mu.Unlock()
 
-		nextIndex := rf.nextIndex[server]
-		if startIndex > nextIndex {
-			startIndex = nextIndex
-		}
-		prevLogIndex := startIndex - 1
-		if nextIndex == commitIndex+1 {
-			// if nextIndex is equal to commitIndex+1
-			// it means, we've replicated all the entries
-			// up to commitIndex, no entries need to replicate
-			// so, we make a heartbeat here. by heartbeat, it
-			// means the prevLogIndex should be the commitIndex
-			prevLogIndex = commitIndex
-		}
-		prevLogTerm, ok := rf.termOf(prevLogIndex)
-		if !ok { // install snapshot
-			args := &InstallSnapshotArgs{
-				Term:              currentTerm,
-				LeaderId:          rf.me,
-				LastIncludedIndex: rf.lastSnapshotIndex,
-				LastIncludedTerm:  rf.lastSnapshotTerm,
-				Data:              rf.snapshot,
-				Done:              true,
-			}
-			rf.mu.Unlock()
+	case <-time.After(time.Millisecond * roundTripMs * 3):
+		rf.logger.Printf("replicate #%d, term: %d upto: %d, timeout", seq, currentTerm, index)
+		// set timeout to true to cancel any pending replication process.
+		// although, there could be replication request on the fly,
+		// the replicateTo process is implemented out-of-order tolerate
+		// way(maybe an out-of-order response could cause some lag, but
+		// it won't harm the correctness)
+		atomic.StoreInt64(&timeout, true_)
+	}
+}
 
-			rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d, start: %d, end: %d, next: %d, cnt: %d",
-				seq, server, args.LastIncludedIndex, args.LastIncludedTerm, startIndex, endIndex, nextIndex, numSnapshotRetry)
-			r, ok := rf.sendInstallSnapshot(server, args)
-			if !ok {
-				numSnapshotRetry++
-				continue // continue to retry
-			}
+func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex int) bool {
+	rf.mu.Lock()
+	start := rf.nextIndex[server]
+	end := upto + 1
 
-			rf.mu.Lock()
-			if r.Term > rf.currentTerm {
-				// stale leader --> follower
-				rf.logger.Printf("replicate #%d, snapshot req to %d, stale leader, term: %d -> %d", seq, server, r.Term, rf.currentTerm)
-				rf.currentTerm = r.Term
-				rf.leaderId = none
-				rf.persist(nil)
-
-				rf.followerC <- struct{}{}
-				rf.mu.Unlock()
-				return false
-			}
-			rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d success",
-				seq, server, args.LastIncludedIndex, args.LastIncludedTerm)
-
-			// update the next index and
-			startIndex = rf.lastSnapshotIndex + 1
-			rf.nextIndex[server] = endIndex
-			// continue the loop for replication if existing
-			// any un-committed entries
-			rf.mu.Unlock()
-			continue
-		}
-		// regular append entry or heartbeat
-		var entries []Entry
-		if prevLogIndex < startIndex {
-			start := rf.index2ind(startIndex)
-			end := rf.index2ind(endIndex)
-			entries = rf.log[start:end]
-		}
-		args := &AppendEntryArgs{
-			Term:         currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      entries,
-			LeaderCommit: commitIndex,
+	if start <= rf.lastSnapshotIndex {
+		// snapshot
+		args := &InstallSnapshotArgs{
+			Term:              currentTerm,
+			LeaderId:          rf.me,
+			LastIncludedIndex: rf.lastSnapshotIndex,
+			LastIncludedTerm:  rf.lastSnapshotTerm,
+			Data:              rf.snapshot,
+			Done:              true,
 		}
 		rf.mu.Unlock()
 
-		rf.logger.Printf("replicate #%d, send ae req to %d, #entries: %d, index: [%d, %d), prevIndex: %d, prevTerm: %d, cnt: %d",
-			seq, server, len(entries), startIndex, endIndex, prevLogIndex, prevLogTerm, numAERetry)
-		r, ok := rf.sendAppendEntry(server, args)
+		rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d, index: [%d, %d)",
+			seq, server, args.LastIncludedIndex, args.LastIncludedTerm, start, end)
+		r, ok := rf.sendInstallSnapshot(server, args)
 		if !ok {
-			numAERetry++
-			continue // continue to retry
+			return false
 		}
 
 		rf.mu.Lock()
 		if r.Term > rf.currentTerm {
 			// stale leader --> follower
-			rf.logger.Printf("replicate #%d, ae req to %d ,stale leader, term: %d -> %d", seq, server, r.Term, rf.currentTerm)
+			rf.logger.Printf("replicate #%d, snapshot req to %d, stale leader, term: %d -> %d", seq, server, r.Term, rf.currentTerm)
 			rf.currentTerm = r.Term
 			rf.leaderId = none
 			rf.persist(nil)
 
 			rf.followerC <- struct{}{}
 			rf.mu.Unlock()
-			return false
-		}
-		if r.Success {
-			rf.logger.Printf("replicate #%d, send ae req to %d success, index: [%d, %d), prev index: %d",
-				seq, server, startIndex, endIndex, prevLogIndex)
-
-			rf.nextIndex[server] = endIndex
-			rf.matchIndex[server] = endIndex - 1
-			rf.mu.Unlock()
 			return true
 		}
+		rf.logger.Printf("replicate #%d, send snapshot req to %d, lastIndex: %d, lastTerm: %d success",
+			seq, server, args.LastIncludedIndex, args.LastIncludedTerm)
 
-		if rf.nextIndex[server] > 1 {
-			// make sure the minimum nextIndex is at least 1 after the decrement
-			rf.nextIndex[server]--
-		}
+		// update the next index and
+		rf.nextIndex[server] = rf.lastSnapshotIndex + 1
 		rf.mu.Unlock()
+
+		// return false to indicate the caller continue to
+		// replicate any un-committed entries
+		return false
 	}
+
+	prevIndex := start - 1
+	prevTerm, _ := rf.termOf(prevIndex)
+	var entries []Entry
+	a := rf.index2ind(start)
+	b := rf.index2ind(end)
+	entries = rf.log[a:b]
+	args := &AppendEntryArgs{
+		Term:         currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+	rf.mu.Unlock()
+
+	rf.logger.Printf("replicate #%d, send ae req to %d, #entries: %d, index: [%d, %d), prevIndex: %d, prevTerm: %d",
+		seq, server, len(entries), start, end, prevIndex, prevTerm)
+	r, ok := rf.sendAppendEntry(server, args)
+	if !ok {
+		return false
+	}
+
+	rf.mu.Lock()
+	if r.Term > rf.currentTerm {
+		// stale leader --> follower
+		rf.logger.Printf("replicate #%d, ae req to %d ,stale leader, term: %d -> %d", seq, server, r.Term, rf.currentTerm)
+		rf.currentTerm = r.Term
+		rf.leaderId = none
+		rf.persist(nil)
+
+		rf.followerC <- struct{}{}
+		rf.mu.Unlock()
+		return true
+	}
+
+	// we might get an out-of-order response caused by the test network setup,
+	// here we try to make the response handle the state update limited to the
+	// correspond request by set the statue with the parameters we used in the
+	// request. it may cause the state going backward a little bit if there is
+	// an out-of-order response, but it will not harm the overall correctness.
+
+	if r.Success {
+		rf.logger.Printf("replicate #%d, send ae req to %d success, index: [%d, %d), prev index: %d",
+			seq, server, start, end, prevIndex)
+
+		rf.nextIndex[server] = end
+		rf.matchIndex[server] = upto
+		rf.mu.Unlock()
+		return true
+	}
+
+	rf.nextIndex[server] = start - 1
+	rf.mu.Unlock()
+
 	return false
 }
 
@@ -1183,7 +1127,7 @@ func (rf *Raft) ticker() {
 					//     and set votedFor to none & reset timer to next vote
 					ok := rf.elect(done)
 					if !ok {
-						return
+						return // election does not succeed
 					}
 					// candidate --> leader:
 					atomic.StoreInt32(&rf.status, Leader)
@@ -1191,7 +1135,7 @@ func (rf *Raft) ticker() {
 					// use two separate path for replication
 					// and heartbeat.
 					// the reason that does not reuse the
-					// heartbeat to do replication is, the
+					// heartbeat to do replication is: the
 					// replication process is implemented
 					// to wait the majority success, however
 					// the heartbeat does not need to wait,
@@ -1222,6 +1166,7 @@ func (rf *Raft) ticker() {
 			tick.Reset(rf.nextVoteTimeout())
 		}
 	}
+	close(cancel)
 }
 
 func (rf *Raft) applyEntry(entries []Entry, commandIndStart, commandIndex int) {
@@ -1303,7 +1248,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]Entry, 1)
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	rf.commandCh = make(chan int, 10)
 
 	rf.leaderId = none
 	rf.followerC = make(chan struct{}, 3)
