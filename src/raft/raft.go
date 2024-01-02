@@ -340,6 +340,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	switch2follower := false
+	votedFor := rf.votedFor
 	term := rf.currentTerm
 	if args.Term > term {
 		rf.votedFor = none
@@ -379,8 +380,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.followerC <- struct{}{}
 	}
 
-	rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d -> %d, votedFor: %d, allow: %v, uptodate: %v, granted: %v",
-		args.CandidateId, args.Term, term, rf.currentTerm, rf.votedFor, isAllowedCandidate, isUpToDate(), voteGranted)
+	rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d -> %d, preVotedFor: %d, allow: %v, uptodate: %v, granted: %v",
+		args.CandidateId, args.Term, term, rf.currentTerm, votedFor, isAllowedCandidate, isUpToDate(), voteGranted)
 }
 
 type AppendEntryArgs struct {
@@ -411,6 +412,10 @@ type AppendEntryReply struct {
 	// true if follower contained entry matching
 	// preLogIndex and prevLogTerm
 	Success bool
+	// fast rollback
+	XTerm  int // term in the conflicting entry(if any)
+	XIndex int // index of first entry with xterm(if any)
+	XLen   int // log length
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
@@ -456,6 +461,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	acceptable := func() bool {
 		if args.PrevLogIndex > 0 {
 			if args.PrevLogIndex > lastIndex {
+				// follower's log is too short
+				reply.XLen = lastIndex + 1
 				return false
 			}
 			prevTerm, ok := rf.termOf(args.PrevLogIndex)
@@ -463,6 +470,18 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 				return false
 			}
 			if prevTerm != args.PrevLogTerm {
+				// index of first entry with the conflict term
+				ind := rf.index2ind(args.PrevLogIndex)
+				xIndex := args.PrevLogIndex
+				for ; ind >= 0; ind-- {
+					if rf.log[ind].Term != prevTerm {
+						break
+					}
+					xIndex--
+				}
+				// set XTerm & XIndex for fast rollback
+				reply.XTerm = prevTerm
+				reply.XIndex = xIndex + 1
 				return false
 			}
 			return true
@@ -809,8 +828,11 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 	// wait first events on ch or done only once with select.
 	var maxTerm int
 	var elected bool
+
+	// use copies for log to avoid data race
 	var numGranted int
 	res := make([]int, len(rf.peers))
+
 	select {
 	case <-ch:
 		mu.Lock()
@@ -823,7 +845,6 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 				maxTerm = a
 			}
 		}
-		// make a copy for log to avoid data race
 		numGranted = granted
 		mu.Unlock()
 	case <-done:
@@ -847,11 +868,10 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 	}
 
 	// candidate --> leader:
+	//  0. leave votedFor as itself
 	//  1. set me as leader id
 	rf.leaderId = rf.me
-	//  2. set votedFor to none
-	rf.votedFor = none
-	//  3. init next index & match index
+	//  2. init next index & match index
 	nextIndex := lastLogIndex + 1
 	for peer := range rf.peers {
 		rf.nextIndex[peer] = nextIndex
@@ -859,8 +879,8 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 	}
 	rf.persist(nil)
 
-	rf.logger.Printf("electing, elected as leader for term: %d, c: %d, a: %d, n: %d, %v",
-		rf.currentTerm, rf.commitIndex, rf.lastApplied, nextIndex, res)
+	rf.logger.Printf("electing, elected as leader for term: %d, v: %d, c: %d, a: %d, n: %d, %v",
+		rf.currentTerm, rf.votedFor, rf.commitIndex, rf.lastApplied, nextIndex, res)
 
 	return true
 }
@@ -899,7 +919,7 @@ func (rf *Raft) heartbeat() {
 
 				rf.followerC <- struct{}{}
 			}
-			rf.logger.Printf("heartbeat #%d to %d %v, seq: %d, %d, term: %d", seq, server, ok, seq, rf.heartbeatSeq, a.Term)
+			rf.logger.Printf("heartbeat #%d to %d %v, curseq: %d, term: %d", seq, server, ok, rf.heartbeatSeq, a.Term)
 		}(i, args)
 	}
 }
@@ -954,9 +974,12 @@ const (
 	true_ = iota + 1
 	abort
 	retry
+	unavailable
 )
 
 func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64, cancel <-chan struct{}) {
+	timeout := time.Millisecond * roundTripMs * 3
+
 	rf.logger.Printf("replicate #%d, term: %d, upto: %d, commitIndex: %d", seq, currentTerm, index, commitIndex)
 	var success int64
 	n := len(rf.peers)
@@ -984,6 +1007,9 @@ func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64, c
 				switch rtcd {
 				case retry:
 					continue // retry the replication until succeed
+				case unavailable:
+					time.Sleep(time.Millisecond * 10)
+					continue // backoff a little bit, then retry
 				case abort:
 					abortCh <- struct{}{}
 					return // terminate the replicate process loop
@@ -1017,7 +1043,7 @@ func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64, c
 		rf.persist(nil)
 		rf.mu.Unlock()
 
-	case <-time.After(time.Millisecond * roundTripMs * 3):
+	case <-time.After(timeout):
 		rf.logger.Printf("replicate #%d, term: %d, upto: %d, timeout", seq, currentTerm, index)
 		// set aborted to true to cancel any pending replication process.
 		// although, there could be replication request on the fly,
@@ -1060,7 +1086,7 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 			seq, server, args.LastIncludedIndex, args.LastIncludedTerm, start, end)
 		r, ok := rf.sendInstallSnapshot(server, args)
 		if !ok {
-			return retry
+			return unavailable
 		}
 
 		rf.mu.Lock()
@@ -1110,7 +1136,7 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 
 	r, ok := rf.sendAppendEntry(server, args)
 	if !ok {
-		return retry
+		return unavailable
 	}
 
 	rf.mu.Lock()
@@ -1142,7 +1168,34 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 		return true_
 	}
 
-	rf.nextIndex[server] = prevIndex
+	nextIndex := prevIndex
+	if r.XTerm != 0 {
+		ind := rf.index2ind(nextIndex)
+		found := false
+		for ; ind >= 0; ind-- {
+			term := rf.log[ind].Term
+			if term > r.XTerm {
+				continue
+			}
+			if term == r.XTerm && !found {
+				found = true
+			}
+			if term < r.XTerm {
+				break
+			}
+		}
+		nextIndex = r.XIndex
+		if found {
+			nextIndex = rf.lastSnapshotIndex + (ind + 1)
+		}
+		rf.logger.Printf("replicate #%d, ae req to %d, fast backup: xterm: %d, xindex: %d, next0: %d, next: %d, found: %v",
+			seq, server, r.XTerm, r.XIndex, prevIndex, nextIndex, found)
+	}
+	if r.XLen != 0 {
+		rf.logger.Printf("replicate #%d, ae req to %d, fast backup: xlen: %d", seq, server, r.XLen)
+		nextIndex = r.XLen
+	}
+	rf.nextIndex[server] = nextIndex
 	rf.mu.Unlock()
 
 	return retry
