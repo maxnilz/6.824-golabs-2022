@@ -293,7 +293,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	//rf.mu.Lock()
 	//defer rf.mu.Unlock()
 
-	rf.logger.Printf("Snapshot, curTerm: %d, index: %d", rf.currentTerm, index)
+	rf.logger.Printf("Snapshot, curterm: %d, index: %d", rf.currentTerm, index)
 
 	ind := rf.index2ind(index)
 	entry := rf.log[ind]
@@ -334,7 +334,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
-		rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d", args.CandidateId, args.Term, rf.currentTerm)
+		rf.logger.Printf("RequestVote, candidate: %d, aterm: %d, curterm: %d", args.CandidateId, args.Term, rf.currentTerm)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
@@ -380,7 +380,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.followerC <- struct{}{}
 	}
 
-	rf.logger.Printf("RequestVote, candidate: %d, args.term: %d, curTerm: %d -> %d, preVotedFor: %d, allow: %v, uptodate: %v, granted: %v",
+	rf.logger.Printf("RequestVote, candidate: %d, aterm: %d, prevterm: %d, curterm: %d, preVotedFor: %d, allow: %v, uptodate: %v, granted: %v",
 		args.CandidateId, args.Term, term, rf.currentTerm, votedFor, isAllowedCandidate, isUpToDate(), voteGranted)
 }
 
@@ -428,7 +428,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		// reply false if term < currentTerm
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("AppendEntry, false, leader: %d, args.term: %d, curTerm: %d, "+
+		rf.logger.Printf("AppendEntry, false, leader: %d, aterm: %d, curterm: %d, "+
 			"lastIndex: %d, #log: %d, #args.entry: %d, prevIndex: %d, prevTerm: %d",
 			args.LeaderId, args.Term, rf.currentTerm,
 			lastIndex, len(rf.log)-1, len(args.Entries),
@@ -444,7 +444,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		if rf.me != rf.leaderId {
 			role = "candidate"
 		}
-		rf.logger.Printf("AppendEntry, stale %v, term: %d -> %d", role, args.Term, rf.currentTerm)
+		rf.logger.Printf("AppendEntry, stale %v, aterm: %d, curterm: %d", role, args.Term, rf.currentTerm)
 		rf.votedFor = none
 		rf.currentTerm = args.Term
 		rf.persist(nil)
@@ -504,7 +504,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 
 	latestIndex, _ := rf.last()
-	rf.logger.Printf("AppendEntry, %v, leader: %d, args.term: %d, curTerm: %d, "+
+	rf.logger.Printf("AppendEntry, %v, leader: %d, aterm: %d, curterm: %d, "+
 		"lastIndex, before: %d, after: %d, #log: %d, #args.entry: %d, prevIndex: %d, prevTerm: %d, commit index: %d-%d, hseq: %d, aseq: %d",
 		reply.Success, args.LeaderId, args.Term, term,
 		lastIndex, latestIndex, len(rf.log)-1, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm,
@@ -562,7 +562,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("InstallSnapshot, rejected, leader: %d, args.Term: %v, curTerm: %v",
+		rf.logger.Printf("InstallSnapshot, rejected, leader: %d, aterm: %v, curterm: %v",
 			args.LeaderId, args.Term, rf.currentTerm)
 		rf.mu.Unlock()
 		return
@@ -575,7 +575,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		if rf.me != rf.leaderId {
 			role = "candidate"
 		}
-		rf.logger.Printf("InstallSnapshot, stale %v, term: %d -> %d", role, args.Term, rf.currentTerm)
+		rf.logger.Printf("InstallSnapshot, stale %v, aterm: %d, curterm: %d", role, args.Term, rf.currentTerm)
 		rf.votedFor = none
 		rf.currentTerm = args.Term
 		rf.persist(nil)
@@ -599,14 +599,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.pendingSnapshot.Write(args.Data)
 	if !args.Done {
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("InstallSnapshot, pending, leader: %d, offset: %v, len: %v, curTerm: %v",
+		rf.logger.Printf("InstallSnapshot, pending, leader: %d, offset: %v, len: %v, curterm: %v",
 			args.LeaderId, args.Offset, len(args.Data), rf.currentTerm)
 		rf.mu.Unlock()
 		return
 	}
 	reply.Term = rf.currentTerm
 	snapshot := rf.pendingSnapshot.Bytes()
-	rf.logger.Printf("InstallSnapshot, accepted, leader: %d, len: %v, curTerm: %v, includedIndex: %d, includedTerm: %d",
+	rf.logger.Printf("InstallSnapshot, accepted, leader: %d, len: %v, curterm: %v, includedIndex: %d, includedTerm: %d",
 		args.LeaderId, len(snapshot), rf.currentTerm, args.LastIncludedIndex, args.LastIncludedTerm)
 	rf.mu.Unlock()
 
@@ -765,9 +765,9 @@ func (rf *Raft) nextHeartbeatTimeout() time.Duration {
 
 func (rf *Raft) elect(done <-chan struct{}) bool {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	if rf.me == rf.leaderId {
+		rf.mu.Unlock()
 		return false // already a leader, do nothing
 	}
 	rf.currentTerm++    // increase the term
@@ -778,7 +778,6 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 
 	n := len(rf.peers)
 	majority := n/2 + 1
-	var mu sync.Mutex
 	var granted int
 	var finished int
 	ans := make([]int, n)
@@ -787,19 +786,21 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 	}
 	ch := make(chan struct{}, n)
 
-	rf.logger.Printf("electing, gathering votes for term: %d", rf.currentTerm)
+	currentTerm := rf.currentTerm
+	rf.logger.Printf("electing, gathering votes for term: %d", currentTerm)
+	rf.mu.Unlock()
 
 	for ind := range rf.peers {
 		if ind == rf.me {
-			mu.Lock()
+			rf.mu.Lock()
 			granted++
 			finished++
-			ans[ind] = rf.currentTerm
-			mu.Unlock()
+			ans[ind] = currentTerm
+			rf.mu.Unlock()
 			continue // voted itself
 		}
 		args := RequestVoteArgs{
-			Term:         rf.currentTerm,
+			Term:         currentTerm,
 			CandidateId:  rf.me,
 			LastLogIndex: lastLogIndex,
 			LastLogTerm:  lastLogTerm,
@@ -809,10 +810,10 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 			rf.logger.Printf("electing, send RequestVote req to %d, term: %d", server, args.Term)
 			r, ok := rf.sendRequestVote(server, args)
 
-			mu.Lock()
-			defer mu.Unlock()
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 
-			if ok && r.VoteGranted {
+			if ok && r.Term == rf.currentTerm && r.VoteGranted {
 				rTerm = r.Term
 				granted++
 			}
@@ -821,7 +822,7 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 			if granted >= majority || finished == n {
 				ch <- struct{}{}
 			}
-			rf.logger.Printf("electing, RequestVote req to %d, term: %d, granted: %v", server, args.Term, r.VoteGranted)
+			rf.logger.Printf("electing, RequestVote req to %d, aterm: %d, rterm: %d, curterm: %d, granted: %v", server, args.Term, r.Term, rf.currentTerm, r.VoteGranted)
 		}(ind, &args)
 	}
 
@@ -831,11 +832,11 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 
 	// use copies for log to avoid data race
 	var numGranted int
-	res := make([]int, len(rf.peers))
+	res := make([]int, len(ans))
 
 	select {
 	case <-ch:
-		mu.Lock()
+		rf.mu.Lock()
 		if granted >= majority {
 			elected = true
 		}
@@ -846,18 +847,20 @@ func (rf *Raft) elect(done <-chan struct{}) bool {
 			}
 		}
 		numGranted = granted
-		mu.Unlock()
+		rf.mu.Unlock()
 	case <-done:
-		rf.logger.Printf("electing, term: %d, canceled", rf.currentTerm)
+		rf.logger.Printf("electing, term: %d, canceled", currentTerm)
 	}
 
 	// handle election results
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term := rf.currentTerm
 	if maxTerm > rf.currentTerm {
 		rf.currentTerm = maxTerm
 		rf.votedFor = none
 		rf.persist(nil)
-		rf.logger.Printf("electing, found higher term: (%d -> %d)", rf.currentTerm, term)
+		rf.logger.Printf("electing, found higher curterm: %d, rterm: %d", rf.currentTerm, term)
 		return false
 	}
 	if !elected {
@@ -911,15 +914,24 @@ func (rf *Raft) heartbeat() {
 			r, ok := rf.sendAppendEntry(server, &a)
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			if !ok {
+				rf.logger.Printf("heartbeat #%d to %d failed, curseq: %d", seq, server, rf.heartbeatSeq)
+				return
+			}
 			if r.Term > rf.currentTerm {
-				rf.logger.Printf("heartbeat #%d, stale leader, aTerm: %d, rTerm: %d, curTerm: %d", seq, a.Term, r.Term, rf.currentTerm)
+				rf.logger.Printf("heartbeat #%d, stale leader, aterm: %d, rterm: %d, curterm: %d", seq, a.Term, r.Term, rf.currentTerm)
 				rf.currentTerm = r.Term
 				rf.leaderId = none
 				rf.persist(nil)
 
 				rf.followerC <- struct{}{}
+				return
 			}
-			rf.logger.Printf("heartbeat #%d to %d %v, curseq: %d, term: %d", seq, server, ok, rf.heartbeatSeq, a.Term)
+			if r.Term < rf.currentTerm {
+				rf.logger.Printf("heartbeat #%d to %d %v, stale heartbeat, curseq: %d, rterm: %d, curterm: %d", seq, server, ok, rf.heartbeatSeq, r.Term, rf.currentTerm)
+				return
+			}
+			rf.logger.Printf("heartbeat #%d to %d ok, curseq: %d, term: %d", seq, server, rf.heartbeatSeq, a.Term)
 		}(i, args)
 	}
 }
@@ -978,7 +990,7 @@ const (
 )
 
 func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64, cancel <-chan struct{}) {
-	timeout := time.Millisecond * roundTripMs * 3
+	timeout := time.Millisecond * roundTripMs * 10
 
 	rf.logger.Printf("replicate #%d, term: %d, upto: %d, commitIndex: %d", seq, currentTerm, index, commitIndex)
 	var success int64
@@ -1090,9 +1102,14 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 		}
 
 		rf.mu.Lock()
+		if r.Term < rf.currentTerm {
+			rf.logger.Printf("replicate #%d, snapshot req to %d, stale snapshot, rterm: %d, curterm: %d", seq, server, r.Term, rf.currentTerm)
+			rf.mu.Unlock()
+			return abort
+		}
 		if r.Term > rf.currentTerm {
 			// stale leader --> follower
-			rf.logger.Printf("replicate #%d, snapshot req to %d, stale leader, term: %d -> %d", seq, server, r.Term, rf.currentTerm)
+			rf.logger.Printf("replicate #%d, snapshot req to %d, stale leader, rterm: %d, curterm: %d", seq, server, r.Term, rf.currentTerm)
 			rf.currentTerm = r.Term
 			rf.leaderId = none
 			rf.persist(nil)
@@ -1140,9 +1157,14 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 	}
 
 	rf.mu.Lock()
+	if r.Term < rf.currentTerm {
+		rf.logger.Printf("replicate #%d, ae req to %d, stale ae, rterm: %d, curterm: %d", seq, server, r.Term, rf.currentTerm)
+		rf.mu.Unlock()
+		return abort
+	}
 	if r.Term > rf.currentTerm {
 		// stale leader --> follower
-		rf.logger.Printf("replicate #%d, ae req to %d ,stale leader, term: %d -> %d", seq, server, r.Term, rf.currentTerm)
+		rf.logger.Printf("replicate #%d, ae req to %d, stale leader, rterm: %d, curterm: %d", seq, server, r.Term, rf.currentTerm)
 		rf.currentTerm = r.Term
 		rf.leaderId = none
 		rf.persist(nil)
