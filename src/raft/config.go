@@ -22,6 +22,9 @@ import "math/big"
 import "encoding/base64"
 import "time"
 import "fmt"
+import "io"
+
+var logger = log.New(io.Discard, "", log.LstdFlags|log.Lmicroseconds)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -356,7 +359,7 @@ func (cfg *config) cleanup() {
 
 // attach server i to the net.
 func (cfg *config) connect(i int) {
-	log.Printf("connect(%d)\n", i)
+	logger.Printf("connect(%d)\n", i)
 
 	cfg.connected[i] = true
 
@@ -379,7 +382,7 @@ func (cfg *config) connect(i int) {
 
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
-	log.Printf("disconnect(%d)\n", i)
+	logger.Printf("disconnect(%d)\n", i)
 
 	cfg.connected[i] = false
 

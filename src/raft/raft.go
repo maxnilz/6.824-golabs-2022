@@ -21,10 +21,9 @@ import (
 	"6.824/labgob"
 	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
-	"os"
-
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -1202,7 +1201,7 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 
 	// we might get an out-of-order response caused by the test network setup,
 	// here we try to make the response handle the state update limited to the
-	// correspond request by set the statue with the parameters we used in the
+	// correspond request by set the state with the parameters we used in the
 	// request. it may cause the state going backward a little bit if there is
 	// an out-of-order response, but it will not harm the overall correctness.
 
@@ -1216,6 +1215,7 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 		return true_
 	}
 
+	// fast rollback/backup
 	nextIndex := prevIndex
 	if r.XTerm != 0 {
 		ind := rf.index2ind(nextIndex)
@@ -1425,9 +1425,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 
 	rf.votedFor = none
-
+	// initialize log in case of fresh new server
 	// leave index 0 unused, first log index is 1
 	rf.log = make([]Entry, 1)
+
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.snapshotCh = make(chan SnapshotRequest, 3)
@@ -1439,7 +1440,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.applyCh = applyCh
 	rf.logger = log.New(
-		os.Stderr,
+		io.Discard,
 		fmt.Sprintf("server/%d ", me),
 		log.LstdFlags|log.Lmicroseconds,
 	)
