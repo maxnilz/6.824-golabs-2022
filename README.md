@@ -13,3 +13,4 @@
 ## References
 
 - http://nil.csail.mit.edu/6.824/2022/schedule.html
+- https://youtube.com/playlist?list=PLrw6a1wE39_tb2fErI4-WkMbsvGQk9_UB&si=IEc6GbVSHbvECzgy
