@@ -9,7 +9,6 @@ package raft
 //
 
 import "testing"
-import "log"
 import "fmt"
 import "time"
 import "math/rand"
@@ -1127,8 +1126,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		}
 
 		// perhaps send enough to get a snapshot
-		nn := SnapShotInterval + (rand.Int() % SnapShotInterval)
-		log.Println("==== nn: ", nn)
+		nn := (SnapShotInterval / 2) + (rand.Int() % SnapShotInterval)
 		for i := 0; i < nn; i++ {
 			cfg.rafts[sender].Start(rand.Int())
 		}
@@ -1199,8 +1197,7 @@ func TestSnapshotAllCrash2D(t *testing.T) {
 
 	for i := 0; i < iters; i++ {
 		// perhaps enough to get a snapshot
-		nn := SnapShotInterval + (rand.Int() % SnapShotInterval)
-		log.Println("==== nn: ", nn)
+		nn := (SnapShotInterval / 2) + (rand.Int() % SnapShotInterval)
 		for i := 0; i < nn; i++ {
 			cfg.one(rand.Int(), servers, true)
 		}
