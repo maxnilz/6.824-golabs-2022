@@ -52,6 +52,9 @@ type ApplyMsg struct {
 	Snapshot      []byte
 	SnapshotTerm  int
 	SnapshotIndex int
+
+	// For 3B:
+	SnapshotAck bool
 }
 
 type Entry struct {
@@ -159,6 +162,10 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.logger.Printf("isLeader: %v, term: %d", isLeader, term)
 
 	return term, isLeader
+}
+
+func (rf *Raft) GetStateSize() int {
+	return rf.persister.RaftStateSize()
 }
 
 // save Raft's persistent state to stable storage,
@@ -283,7 +290,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// 3. applierSnap start a snapshot to Raft
 	// 4. Snapshot trying to acquire the lock.
 	//
-	// So use snapshotCh as a workaround to avoid acquire lock on rf.mu
+	// So use a buffered channel as a workaround to avoid acquire lock on rf.mu
 	req := SnapshotRequest{
 		index:    index,
 		snapshot: snapshot,
@@ -1331,13 +1338,29 @@ func (rf *Raft) ticker() {
 		case req := <-rf.snapshotCh:
 			rf.mu.Lock()
 			index, snapshot := req.index, req.snapshot
-			rf.logger.Printf("Snapshot, curterm: %d, index: %d", rf.currentTerm, index)
-			ind := rf.index2ind(index)
-			entry := rf.log[ind]
+			lastIndex, _ := rf.last()
+			rf.logger.Printf("snapshot, curterm: %d, index: %d, lastIndex: %d, aidx: %d, cidx: %d",
+				rf.currentTerm, index, lastIndex, rf.lastApplied, rf.commitIndex)
+			term := rf.currentTerm
+			if lastIndex >= index {
+				ind := rf.index2ind(index)
+				entry := rf.log[ind]
+				term = entry.Term
+			}
+			rf.trimLogs(index, term)
 			rf.snapshot = snapshot
-			rf.trimLogs(index, entry.Term)
 			rf.persist(snapshot)
+			if rf.lastApplied < index {
+				rf.lastApplied = index
+			}
+			if rf.commitIndex < index {
+				rf.commitIndex = index
+			}
 			rf.mu.Unlock()
+
+			// send an ack to the snapshot issuer.
+			rf.applyCh <- ApplyMsg{SnapshotAck: true}
+
 		}
 	}
 	close(cancel)

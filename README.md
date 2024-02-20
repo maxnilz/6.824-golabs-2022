@@ -5,8 +5,8 @@
 - [x] Lab 2B: log/replication [raft](src/raft/raft.go)
 - [x] Lab 2C: persistence [raft](src/raft/raft.go)
 - [x] Lab 2D: log compaction [raft](src/raft/raft.go)
-- [ ] Lab 3A: Key/value service without snapshots
-- [ ] Lab 3B: Key/value service with snapshots
+- [x] Lab 3A: Key/value service without snapshots
+- [x] Lab 3B: Key/value service with snapshots
 - [ ] Lab 4A: The Shard controller
 - [ ] Lab 4B: Sharded Key/Value Server 
 

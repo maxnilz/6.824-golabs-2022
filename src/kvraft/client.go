@@ -1,13 +1,23 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
-
+import (
+	"6.824/labrpc"
+	"crypto/rand"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"sync/atomic"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderId  int32
+	clientId  int64
+	requestId int64
+
+	logger *log.Logger
 }
 
 func nrand() int64 {
@@ -21,10 +31,19 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.leaderId = 0
+	ck.clientId = nrand()
+	ck.requestId = 0
+
+	ck.logger = log.New(
+		io.Discard,
+		fmt.Sprintf("clerk/%d ", ck.clientId),
+		log.LstdFlags|log.Lmicroseconds,
+	)
+
 	return ck
 }
 
-//
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
@@ -35,14 +54,32 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	n := int32(len(ck.servers))
+	requestId := atomic.AddInt64(&ck.requestId, 1)
+
+	args := GetArgs{
+		Key:       key,
+		ClientId:  ck.clientId,
+		RequestId: requestId,
+	}
+	i := atomic.LoadInt32(&ck.leaderId)
+	for ; ; i = (i + 1) % n {
+		reply := GetReply{}
+		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			continue
+		}
+		atomic.StoreInt32(&ck.leaderId, i)
+		if reply.Err == ErrNoKey {
+			return ""
+		}
+		return reply.Value
+	}
 }
 
-//
 // shared by Put and Append.
 //
 // you can send an RPC with code like this:
@@ -51,9 +88,27 @@ func (ck *Clerk) Get(key string) string {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	n := int32(len(ck.servers))
+	requestId := atomic.AddInt64(&ck.requestId, 1)
+	args := PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		ClientId:  ck.clientId,
+		RequestId: requestId,
+	}
+	i := atomic.LoadInt32(&ck.leaderId)
+	for ; ; i = (i + 1) % n {
+		reply := PutAppendReply{}
+		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+		if !ok || reply.Err != OK {
+			continue
+		}
+		atomic.StoreInt32(&ck.leaderId, i)
+		return
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
