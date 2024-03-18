@@ -7,8 +7,8 @@ import (
 	"6.824/shardctrler"
 	"bytes"
 	"fmt"
+	"io"
 	"log"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -757,7 +757,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.shards = make(map[int]*Shard)
 	kv.results = make(map[int]chan *OpRes)
 	kv.logger = log.New(
-		os.Stdout,
+		io.Discard,
 		fmt.Sprintf("kvserver/%d-%d %d ", gid, me, epoch),
 		log.LstdFlags|log.Lmicroseconds,
 	)

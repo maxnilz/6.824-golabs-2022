@@ -6,8 +6,8 @@ import (
 	"6.824/raft"
 	"bytes"
 	"fmt"
+	"io"
 	"log"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -667,7 +667,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.maxraftstate = 1000
 	sc.results = make(map[int]chan *OpRes)
 	sc.logger = log.New(
-		os.Stdout,
+		io.Discard,
 		fmt.Sprintf("ctrl/%d ", me),
 		log.LstdFlags|log.Lmicroseconds,
 	)

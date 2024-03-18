@@ -21,10 +21,9 @@ import (
 	"6.824/labgob"
 	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
-	"os"
-
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -1475,7 +1474,7 @@ func (rf *Raft) String() string {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	logger = log.New(
-		os.Stdout,
+		io.Discard,
 		fmt.Sprintf("server/%d ", me),
 		log.LstdFlags|log.Lmicroseconds,
 	)
@@ -1485,7 +1484,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func GroupMake(peers []*labrpc.ClientEnd, gid, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	logger = log.New(
-		os.Stdout,
+		io.Discard,
 		fmt.Sprintf("server/%d-%d ", gid, me),
 		log.LstdFlags|log.Lmicroseconds,
 	)
