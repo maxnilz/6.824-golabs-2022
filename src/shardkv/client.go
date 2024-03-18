@@ -8,17 +8,18 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
-import "6.824/shardctrler"
-import "time"
+import (
+	"6.824/labrpc"
+	"6.824/shardctrler"
+	"crypto/rand"
+	"math/big"
+	"sync/atomic"
+	"time"
+)
 
-//
 // which shard is a key in?
 // please use this function,
 // and please do not change it.
-//
 func key2shard(key string) int {
 	shard := 0
 	if len(key) > 0 {
@@ -40,9 +41,10 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId  int64
+	requestId int64
 }
 
-//
 // the tester calls MakeClerk.
 //
 // ctrlers[] is needed to call shardctrler.MakeClerk().
@@ -50,27 +52,32 @@ type Clerk struct {
 // make_end(servername) turns a server name from a
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
-//
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
 	return ck
 }
 
-//
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
-//
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
 
+	requestId := atomic.AddInt64(&ck.requestId, 1)
+	shard := key2shard(key)
+
+	args.ClientId = ck.clientId
+	args.RequestId = requestId
+	args.ShardId = shard
+
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
@@ -95,19 +102,22 @@ func (ck *Clerk) Get(key string) string {
 	return ""
 }
 
-//
 // shared by Put and Append.
 // You will have to modify this function.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args := PutAppendArgs{}
 	args.Key = key
 	args.Value = value
 	args.Op = op
 
+	requestId := atomic.AddInt64(&ck.requestId, 1)
+	shard := key2shard(key)
+
+	args.ClientId = ck.clientId
+	args.RequestId = requestId
+	args.ShardId = shard
 
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {

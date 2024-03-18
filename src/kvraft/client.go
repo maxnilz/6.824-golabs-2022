@@ -3,11 +3,9 @@ package kvraft
 import (
 	"6.824/labrpc"
 	"crypto/rand"
-	"fmt"
-	"io"
-	"log"
 	"math/big"
 	"sync/atomic"
+	"time"
 )
 
 type Clerk struct {
@@ -16,8 +14,6 @@ type Clerk struct {
 	leaderId  int32
 	clientId  int64
 	requestId int64
-
-	logger *log.Logger
 }
 
 func nrand() int64 {
@@ -34,13 +30,6 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.leaderId = 0
 	ck.clientId = nrand()
 	ck.requestId = 0
-
-	ck.logger = log.New(
-		io.Discard,
-		fmt.Sprintf("clerk/%d ", ck.clientId),
-		log.LstdFlags|log.Lmicroseconds,
-	)
-
 	return ck
 }
 
@@ -73,8 +62,12 @@ func (ck *Clerk) Get(key string) string {
 			continue
 		}
 		atomic.StoreInt32(&ck.leaderId, i)
-		if reply.Err == ErrNoKey {
-			return ""
+		if reply.Err != OK {
+			if reply.Err == ErrNoKey {
+				return ""
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 		return reply.Value
 	}
@@ -104,6 +97,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		reply := PutAppendReply{}
 		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 		if !ok || reply.Err != OK {
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		atomic.StoreInt32(&ck.leaderId, i)

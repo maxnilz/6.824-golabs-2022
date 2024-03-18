@@ -11,3 +11,5 @@ mrtmp.*
 /main/mrcoordinator
 /main/mrsequential
 /main/mrworker
+*.log
+a_test.go

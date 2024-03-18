@@ -21,9 +21,10 @@ import (
 	"6.824/labgob"
 	"bytes"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
+	"os"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -437,11 +438,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			role = "candidate"
 		}
 		rf.logger.Printf("AppendEntry, stale %v, aterm: %d, curterm: %d", role, args.Term, rf.currentTerm)
-		rf.votedFor = none
 		rf.currentTerm = args.Term
-		rf.persist(nil)
-
 		rf.leaderId = args.LeaderId
+		rf.votedFor = none
+
+		rf.persist(nil)
 	}
 
 	// as long as the AE is valid
@@ -720,8 +721,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	rf.logger.Printf("Start, appending command %v, term: %d", command, term)
-
 	entry := Entry{
 		Command: command,
 		Term:    rf.currentTerm,
@@ -730,7 +729,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index, _ = rf.last()
 	rf.persist(nil)
 
-	rf.logger.Printf("Start, command %v at index: %d, term: %d", command, index, term)
+	rf.logger.Printf("Start, command: %v at index: %d, term: %d", command, index, term)
 
 	return index, term, isLeader
 }
@@ -978,10 +977,19 @@ func (rf *Raft) replicate(done <-chan struct{}) {
 			// if we get majority success & committed the log.
 			// reuse rf.mu to avoid data race.
 			close(cancel)
-			cancel = make(chan struct{})
+			// create a new cancel channel for future
+			// cancellation.
+			// reuse rf.mu and make a new chan then a
+			// value copy to add an indirection read and
+			// avoid data race on cancel var, i.e., avoid
+			// the following replicateToAll func read it
+			// directly, which maybe cause data if the
+			// main goroutine trying to write it.
+			cc := make(chan struct{})
+			cancel = cc
 			rf.mu.Unlock()
 
-			rf.replicateToAll(currentTerm, index, commitIndex, seq, cancel)
+			rf.replicateToAll(currentTerm, index, commitIndex, seq, cc)
 		}
 	}()
 
@@ -1075,16 +1083,22 @@ func (rf *Raft) replicateToAll(currentTerm, index, commitIndex int, seq int64, c
 		for peer := range rf.peers {
 			res[peer] = atomic.LoadInt64(&ans[peer])
 		}
-		rf.logger.Printf("replicate #%d, term: %d, upto: %d, succeed, ans: %v", seq, currentTerm, index, res)
 
 		rf.mu.Lock()
+		// this replication process maybe out-of-date, and
+		// rf.lastApplied is updated outside of this func.
+		rf.logger.Printf("replicate #%d, term: %d, upto: %d, lastApplied: %d, succeed, ans: %v",
+			seq, currentTerm, index, rf.lastApplied, res)
+
 		commandIndex := rf.lastApplied + 1
-		start := rf.index2ind(commandIndex)
-		end := rf.index2ind(index) + 1
-		entries := rf.log[start:end]
-		rf.commitIndex = index
-		rf.applyEntry(entries, start, commandIndex)
-		rf.persist(nil)
+		if commandIndex <= index {
+			start := rf.index2ind(commandIndex)
+			end := rf.index2ind(index) + 1
+			entries := rf.log[start:end]
+			rf.commitIndex = index
+			rf.applyEntry(entries, start, commandIndex)
+			rf.persist(nil)
+		}
 		rf.mu.Unlock()
 
 	case <-time.After(timeout):
@@ -1110,9 +1124,13 @@ func (rf *Raft) replicateTo(seq int64, currentTerm, server, upto, commitIndex in
 	}
 	start := rf.nextIndex[server]
 	end := upto + 1
-	if start == 0 {
+	if start == 0 || start > end {
 		rf.mu.Unlock()
-		return abort // start should be at least 1
+		// 1. start should be at least 1
+		// 2. start should be less than or
+		// equal to end(e.g., rf.nextIndex
+		// get updated outside of this func)
+		return abort
 	}
 	if start <= rf.lastSnapshotIndex {
 		// snapshot
@@ -1335,32 +1353,6 @@ func (rf *Raft) ticker() {
 			atomic.StoreInt32(&rf.status, follower)
 			tick.Reset(rf.nextVoteTimeout())
 
-		case req := <-rf.snapshotCh:
-			rf.mu.Lock()
-			index, snapshot := req.index, req.snapshot
-			lastIndex, _ := rf.last()
-			rf.logger.Printf("snapshot, curterm: %d, index: %d, lastIndex: %d, aidx: %d, cidx: %d",
-				rf.currentTerm, index, lastIndex, rf.lastApplied, rf.commitIndex)
-			term := rf.currentTerm
-			if lastIndex >= index {
-				ind := rf.index2ind(index)
-				entry := rf.log[ind]
-				term = entry.Term
-			}
-			rf.trimLogs(index, term)
-			rf.snapshot = snapshot
-			rf.persist(snapshot)
-			if rf.lastApplied < index {
-				rf.lastApplied = index
-			}
-			if rf.commitIndex < index {
-				rf.commitIndex = index
-			}
-			rf.mu.Unlock()
-
-			// send an ack to the snapshot issuer.
-			rf.applyCh <- ApplyMsg{SnapshotAck: true}
-
 		}
 	}
 	close(cancel)
@@ -1381,6 +1373,48 @@ func (rf *Raft) applyEntry(entries []Entry, commandIndStart, commandIndex int) {
 
 		commandIndex++
 	}
+}
+
+func (rf *Raft) applySnapshot() {
+	for req := range rf.snapshotCh {
+
+		rf.installSnapshot(req.index, req.snapshot)
+
+		// send an ack to the snapshot issuer.
+		rf.applyCh <- ApplyMsg{SnapshotIndex: req.index, SnapshotAck: true}
+
+	}
+}
+
+func (rf *Raft) installSnapshot(index int, snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.lastSnapshotIndex >= index {
+		return // found a stale snapshot, ignore it, but ack it anyway
+	}
+
+	lastIndex, _ := rf.last()
+
+	rf.logger.Printf("snapshot, curterm: %d, index: %d, lastIndex: %d, aidx: %d, cidx: %d",
+		rf.currentTerm, index, lastIndex, rf.lastApplied, rf.commitIndex)
+
+	term := rf.currentTerm
+	if lastIndex >= index {
+		ind := rf.index2ind(index)
+		entry := rf.log[ind]
+		term = entry.Term
+	}
+
+	rf.trimLogs(index, term)
+	rf.snapshot = snapshot
+	if rf.lastApplied < index {
+		rf.lastApplied = index
+	}
+	if rf.commitIndex < index {
+		rf.commitIndex = index
+	}
+	rf.persist(snapshot)
 }
 
 // termOf return the term of the give index, if the index is
@@ -1440,6 +1474,27 @@ func (rf *Raft) String() string {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	logger = log.New(
+		os.Stdout,
+		fmt.Sprintf("server/%d ", me),
+		log.LstdFlags|log.Lmicroseconds,
+	)
+	return makeraft(logger, peers, me, persister, applyCh)
+}
+
+func GroupMake(peers []*labrpc.ClientEnd, gid, me int,
+	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	logger = log.New(
+		os.Stdout,
+		fmt.Sprintf("server/%d-%d ", gid, me),
+		log.LstdFlags|log.Lmicroseconds,
+	)
+	return makeraft(logger, peers, me, persister, applyCh)
+}
+
+func makeraft(logger *log.Logger, peers []*labrpc.ClientEnd, me int,
+	persister *Persister, applyCh chan ApplyMsg) *Raft {
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -1462,17 +1517,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.pendingSnapshot = &bytes.Buffer{}
 
 	rf.applyCh = applyCh
-	rf.logger = log.New(
-		io.Discard,
-		fmt.Sprintf("server/%d ", me),
-		log.LstdFlags|log.Lmicroseconds,
-	)
+	rf.logger = logger
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go rf.applySnapshot()
 
 	rf.logger.Printf("make raft: %v", rf)
 

@@ -22,6 +22,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	opGet    = "Get"
+	opPut    = "Put"
+	opAppend = "Append"
+)
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -35,6 +41,17 @@ type Op struct {
 	// ClientId & RequestId together uniquely identify
 	// a client operation. RequestId of a given client
 	// is increases monotonically.
+	ClientId  int64
+	RequestId int64
+}
+
+type OpRes struct {
+	Err Err
+
+	Type  string
+	Key   string
+	Value string
+
 	ClientId  int64
 	RequestId int64
 }
@@ -56,12 +73,10 @@ type KVServer struct {
 
 	// channels for notifying the client when the index is
 	// applied to db from raft.
-	waitersCh map[int]chan *Op
+	results map[int]chan *OpRes
 
 	// logger
 	logger *log.Logger
-
-	index int
 
 	lastAppliedIndex  int
 	lastSnapshotTerm  int
@@ -70,27 +85,25 @@ type KVServer struct {
 	hasSnapshotPending bool
 }
 
-const (
-	getOp    = "Get"
-	putOp    = "Put"
-	appendOp = "Append"
-)
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	op := Op{
-		Type:      getOp,
+		Type:      opGet,
 		Key:       args.Key,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	appliedOp, ok := kv.waitOpApplied(op)
+	res, ok := kv.waitOpApplied(op)
 	if !ok {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	if res.Err != OK {
+		reply.Err = res.Err
+		return
+	}
 	reply.Err = OK
-	reply.Value = appliedOp.Value
+	reply.Value = res.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -102,65 +115,72 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	if _, ok := kv.waitOpApplied(op); !ok {
+	res, ok := kv.waitOpApplied(op)
+	if !ok {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	if res.Err != OK {
+		reply.Err = res.Err
+		return
+	}
 	reply.Err = OK
-	return
 }
 
-func (kv *KVServer) waitOpApplied(op Op) (*Op, bool) {
+func (kv *KVServer) waitOpApplied(op Op) (*OpRes, bool) {
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		return nil, false
 	}
 
-	kv.logger.Printf("client: %d, reqId: %d, %s key: %s, index: %d",
-		op.ClientId, op.RequestId, op.Type, op.Key, index)
+	kv.logger.Printf("%s %s at index %d, %d/%d", op.Type, op.Key, index, op.ClientId, op.RequestId)
 
 	kv.mu.Lock()
-	kv.index = index
-	ch, ok := kv.waitersCh[index]
+	ch, ok := kv.results[index]
 	if !ok {
-		ch = make(chan *Op, 1)
-		kv.waitersCh[index] = ch
+		ch = make(chan *OpRes, 1)
+		kv.results[index] = ch
 	}
 	kv.mu.Unlock()
 
 	select {
-	case appliedOp := <-ch:
-		if appliedOp.ClientId != op.ClientId || appliedOp.RequestId != op.RequestId {
+	case res := <-ch:
+		if res.ClientId != op.ClientId || res.RequestId != op.RequestId {
 
-			kv.logger.Printf("client: %d, reqId: %d, %s key: %s, index: %d, confict",
-				op.ClientId, op.RequestId, op.Type, op.Key, index)
+			kv.logger.Printf("%s %s at index %d confict with applied op: %s %s, %d/%d(%d/%d)",
+				op.Type, op.Key, index, res.Type, res.Key, op.ClientId, op.RequestId, res.ClientId, res.RequestId)
 
 			kv.mu.Lock()
-			delete(kv.waitersCh, index)
+			delete(kv.results, index)
 			kv.mu.Unlock()
 
-			return nil, false
+			res.Err = ErrConflict
+			return res, true
 		}
 
-		kv.logger.Printf("client: %d, reqId: %d, %s key: %s, index: %d, ok",
-			op.ClientId, op.RequestId, op.Type, op.Key, index)
+		kv.logger.Printf("%s %s at index %d ok, %d/%d", op.Type, op.Key, index, op.ClientId, op.RequestId)
 
 		kv.mu.Lock()
-		delete(kv.waitersCh, index)
+		delete(kv.results, index)
 		kv.mu.Unlock()
 
-		return appliedOp, true
+		return res, true
 
 	case <-time.After(3 * time.Second):
 
-		kv.logger.Printf("client: %d, reqId: %d, %s key: %s, index: %d, timeout",
-			op.ClientId, op.RequestId, op.Type, op.Key, index)
+		kv.logger.Printf("%s %s at index %d timeout, %d/%d", op.Type, op.Key, index, op.ClientId, op.RequestId)
 
 		kv.mu.Lock()
-		delete(kv.waitersCh, index)
+		delete(kv.results, index)
 		kv.mu.Unlock()
 
-		return nil, false
+		res := OpRes{
+			Err:       ErrTimeout,
+			Key:       op.Key,
+			ClientId:  op.ClientId,
+			RequestId: op.RequestId,
+		}
+		return &res, true
 	}
 }
 
@@ -182,44 +202,64 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := msg.Command.(Op)
 	index := msg.CommandIndex
+	op := msg.Command.(Op)
+	clientId, requestId := op.ClientId, op.RequestId
 
 	kv.lastAppliedIndex = index
 
-	kv.logger.Printf("applier, index: %d, key: %s", index, op.Key)
+	res := OpRes{
+		Err:       OK,
+		Type:      op.Type,
+		Key:       op.Key,
+		ClientId:  clientId,
+		RequestId: requestId,
+	}
 
 	switch op.Type {
-	case getOp:
+	case opGet:
 		// Get will always get the latest version
-		op.Value = kv.db[op.Key]
-	case putOp, appendOp:
-		clientId, requestId := op.ClientId, op.RequestId
+		kv.logger.Printf("applier, apply %s %s at index %d", op.Type, op.Key, index)
+
+		value, ok := kv.db[op.Key]
+		if !ok {
+			res.Err = ErrNoKey
+			break
+		}
+		res.Value = value
+
+	case opPut, opAppend:
 		lastAppliedReqId := kv.lastApplied[clientId]
 		// duplicate detection,
 		// Put & Append should execute only if
 		// the request is not applied yet before.
-		if requestId > lastAppliedReqId {
-			switch op.Type {
-			case putOp:
-				kv.db[op.Key] = op.Value
-			case appendOp:
-				kv.db[op.Key] += op.Value
-			}
-			kv.lastApplied[clientId] = requestId
+		// For example: the Clerk sends a request to
+		// a kvserver leader in one term, times out
+		// waiting for a reply, and re-sends the request
+		// to a new leader in another term.
+		if requestId <= lastAppliedReqId {
+			kv.logger.Printf("applier, stale %s %s at index %d, requestId: %d, lastAppliedReqId: %d, client: %d",
+				op.Type, op.Key, index, requestId, lastAppliedReqId, clientId)
+			break // stale request, ignoring
 		}
 
-		if requestId <= lastAppliedReqId {
-			kv.logger.Printf("applier, client: %d, reqId: %d, %s key: %s, index: %d, duplication found, %d, %d",
-				op.ClientId, op.RequestId, op.Type, op.Key, index, requestId, lastAppliedReqId)
+		kv.logger.Printf("applier, apply %s %s at index %d", op.Type, op.Key, index)
+
+		switch op.Type {
+		case opPut:
+			kv.db[op.Key] = op.Value
+		case opAppend:
+			kv.db[op.Key] += op.Value
 		}
+		kv.lastApplied[clientId] = requestId
+		res.Value = kv.db[op.Key]
+
 	}
 
-	ch, ok := kv.waitersCh[index]
-	if ok {
-		kv.logger.Printf("applier, sending op at index: %d", index)
-		ch <- &op
-		kv.logger.Printf("applier, sent op at index: %d", index)
+	if ch, ok := kv.results[index]; ok {
+		kv.logger.Printf("applier, send res at index: %d", index)
+		ch <- &res
+		kv.logger.Printf("applier, sent res at index: %d", index)
 	}
 	kv.checkRaftState(index)
 }
@@ -233,12 +273,11 @@ func (kv *KVServer) checkRaftState(index int) bool {
 		return false // not reach the threshold
 	}
 
-	kv.logger.Printf("start snapshot at index: %d, raftsize: %d(%d), hasSnapshotPending: %v",
-		index, sz, kv.maxraftstate, kv.hasSnapshotPending)
-
 	if kv.hasSnapshotPending {
 		return false // existing ongoing snapshot
 	}
+
+	kv.logger.Printf("start snapshot at index %d, raftsize: %d(%d)", index, sz, kv.maxraftstate)
 
 	w := bytes.Buffer{}
 	a := labgob.NewEncoder(&w)
@@ -256,13 +295,12 @@ func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	applicable := kv.isSnapshotApplicable(msg)
+	if kv.lastAppliedIndex > 0 && msg.SnapshotIndex <= kv.lastAppliedIndex {
 
-	kv.logger.Printf("applier, snapshot, cur: %d %d, last: %d %d %d, applicable: %v",
-		msg.SnapshotTerm, msg.SnapshotIndex, kv.lastSnapshotTerm, kv.lastSnapshotIndex, kv.lastAppliedIndex, applicable)
+		kv.logger.Printf("applier, ignoreing snapshot, index: %d, applied: %v",
+			msg.SnapshotIndex, kv.lastAppliedIndex)
 
-	if !applicable {
-		return false // snapshot is not applicable
+		return false
 	}
 
 	kv.lastSnapshotTerm = msg.SnapshotTerm
@@ -274,24 +312,17 @@ func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) bool {
 	a.Decode(&kv.db)
 	a.Decode(&kv.lastApplied)
 
-	return true
-}
+	kv.logger.Printf("applier, snapshot, cur: %d %d, last: %d %d %d",
+		msg.SnapshotTerm, msg.SnapshotIndex, kv.lastSnapshotTerm, kv.lastSnapshotIndex, kv.lastAppliedIndex)
 
-func (kv *KVServer) isSnapshotApplicable(msg raft.ApplyMsg) bool {
-	if kv.lastSnapshotTerm < msg.SnapshotTerm {
-		return true
-	}
-	if kv.lastSnapshotTerm == msg.SnapshotTerm && kv.lastAppliedIndex < msg.SnapshotIndex {
-		return true
-	}
-	return false
+	return true
 }
 
 func (kv *KVServer) ackSnapshot() {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	kv.logger.Printf("ack snapshot at index: %d", kv.lastSnapshotIndex)
+	kv.logger.Printf("ack snapshot at index %d", kv.lastSnapshotIndex)
 
 	kv.hasSnapshotPending = false
 }
@@ -340,7 +371,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.db = make(map[string]string)
 	kv.lastApplied = make(map[int64]int64)
 
-	kv.waitersCh = make(map[int]chan *Op)
+	kv.results = make(map[int]chan *OpRes)
 	kv.logger = log.New(
 		io.Discard,
 		fmt.Sprintf("kvserver/%d ", me),
